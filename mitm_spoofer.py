@@ -674,9 +674,3 @@ if __name__ == "__main__":
         # The finally block is the ultimate place to ensure cleanup happens
         if not STOP_ATTACK: # Only clean up if the signal handler didn't already
              cleanup()
-    except Exception as e:
-        print(f"\n[!!!] An unexpected error occurred: {e}")
-    finally:
-        # The finally block is the ultimate place to ensure cleanup happens
-        if not STOP_ATTACK: # Only clean up if the signal handler didn't already
-             cleanup()
