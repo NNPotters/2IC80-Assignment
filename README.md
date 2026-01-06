@@ -2,8 +2,8 @@
 
 By Sotiris Charalampopoulos (1785117), Nanda Potters (1983881), and Stefan Birca (1924818).
 
-The current version is for the midterm with the deadline 08-12-2025.
-It has ARP + DNS attack (no SSL strip yet). It is not fully fledged yet.
+The current version is for the final deliverable with the deadline 17-01-2026.
+It has ARP + DNS attack (with SSL strip capabilities). It is fully fledged and ready to plug-and-play via terminal comands (to be defined later).
 
 ## Dependent Global Variables
 
@@ -15,7 +15,9 @@ The **INTERFACE** global variable is set to the interface of the attacker's mach
 
 The **SPOOF_MAP** global variable has the mappings of the targeted domain to the spoofed IP address (`www.fakelogin.net` to **ATTACKER_IP** here)
 
-## Testing
+The **MODE** global variable is set to either `SILENT` (Targeted DNS spoofing (SPOOF_MAP only), Slow ARP (every 4 seconds)) or `ALL_OUT` (Spoof ALL DNS requests, Fast ARP (every 0.5 seconds)).
+
+## Testing (outdated: before SSL stripping, Operational Modes and Command line flags)
 
 1. On the victim device, run: `nslookup www.fakelogin.net`. This will give this output (not spoofed, `192.168.88.1` is the **GATEWAY_IP**):
     ```

