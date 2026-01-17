@@ -60,6 +60,9 @@ When victim visits HTTP websites:
 - Secure flags are removed from cookies
 - All traffic including POST data is logged for analysis
 
+## Demostration Video
+A demo video presenting the tool in action can be found [here](https://tuenl-my.sharepoint.com/:v:/g/personal/s_birca_student_tue_nl/IQBsqnjg29PXS4Fwwe3prCMuASuhaODbLIgRWV3pqM-Xg5c?e=R6WSc0).
+
 ## Usage
 
 ### Command Line Arguments
